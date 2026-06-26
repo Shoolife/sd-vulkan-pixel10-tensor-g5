@@ -317,6 +317,92 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
     c.destroy(); return e;
 }
 
+// ====================== JNI: TRANSFORMER BLOCK ======================
+// shaders[13]: groupnorm,conv2d,addbias,addbias2,t_chw2hwc,layernorm,matmul,split_heads,attention,merge_heads,add,t_hwc2chw,geglu
+// weights[29]: x,ctx,gn_w,gn_b,pin_w,pin_b,n1_w,n1_b,q1,k1,v1,o1,o1_b,n2_w,n2_b,q2,k2,v2,o2,o2_b,n3_w,n3_b,geglu,geglu_b,ffout,ffout_b,pout_w,pout_b,y
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_runTransformerBlock(
+        JNIEnv* env, jobject, jobjectArray shaders, jobjectArray weights,
+        jint C, jint H, jint W, jint ctxN, jint ctxD, jint nh) {
+    VkCtx c; if(!c.init()) return -1;
+    auto getArr=[&](jobjectArray a,int i){ jbyteArray e=(jbyteArray)env->GetObjectArrayElement(a,i);
+        jsize l=env->GetArrayLength(e); std::vector<uint8_t> v(l); env->GetByteArrayRegion(e,0,l,(jbyte*)v.data()); return v; };
+    std::vector<std::vector<uint8_t>> sh(13), w(29);
+    for(int i=0;i<13;i++) sh[i]=getArr(shaders,i);
+    for(int i=0;i<29;i++) w[i]=getArr(weights,i);
+
+    uint32_t HW=(uint32_t)H*W, d=(uint32_t)C/nh, C2=1280, PROJ=2560;
+    auto mk=[&](int i, VkDeviceSize bytes){ Buf b=c.alloc(bytes,true); c.upload(b,w[i].data(),bytes); return b; };
+    // веса
+    Buf bx=mk(0,(VkDeviceSize)C*HW*2), bctx=mk(1,(VkDeviceSize)ctxN*ctxD*2);
+    Buf gnw=mk(2,C*2),gnb=mk(3,C*2), pinw=mk(4,(VkDeviceSize)C*C*2),pinb=mk(5,C*2);
+    Buf n1w=mk(6,C*2),n1b=mk(7,C*2), q1=mk(8,(VkDeviceSize)C*C*2),k1=mk(9,(VkDeviceSize)C*C*2),v1=mk(10,(VkDeviceSize)C*C*2),o1=mk(11,(VkDeviceSize)C*C*2),o1b=mk(12,C*2);
+    Buf n2w=mk(13,C*2),n2b=mk(14,C*2), q2=mk(15,(VkDeviceSize)C*C*2),k2=mk(16,(VkDeviceSize)ctxD*C*2),v2=mk(17,(VkDeviceSize)ctxD*C*2),o2=mk(18,(VkDeviceSize)C*C*2),o2b=mk(19,C*2);
+    Buf n3w=mk(20,C*2),n3b=mk(21,C*2), ggw=mk(22,(VkDeviceSize)C*PROJ*2),ggb=mk(23,(VkDeviceSize)PROJ*2),fow=mk(24,(VkDeviceSize)C2*C*2),fob=mk(25,C*2);
+    Buf poutw=mk(26,(VkDeviceSize)C*C*2),poutb=mk(27,C*2);
+    std::vector<__fp16> yref((size_t)C*HW); memcpy(yref.data(),w[28].data(),(size_t)C*HW*2);
+
+    auto A=[&](VkDeviceSize n){ return c.alloc(n*2,true); };
+    Buf g1=A(C*HW),p1=A(C*HW),t=A(HW*C),h=A(HW*C),q=A(HW*C),k=A(HW*C),v=A(HW*C),a=A(HW*C);
+    Buf qh=A((VkDeviceSize)nh*HW*d),kh=A((VkDeviceSize)nh*HW*d),vh=A((VkDeviceSize)nh*HW*d),ah=A((VkDeviceSize)nh*HW*d);
+    Buf kc=A((VkDeviceSize)ctxN*C),vc=A((VkDeviceSize)ctxN*C),khc=A((VkDeviceSize)nh*ctxN*d),vhc=A((VkDeviceSize)nh*ctxN*d);
+    Buf gg=A((VkDeviceSize)HW*PROJ),gf=A((VkDeviceSize)HW*C2),ff=A(HW*C),tt=A(C*HW),po=A(C*HW),out=A(C*HW);
+
+    auto op=[&](int si,std::vector<Buf*> bufs,const void* push,uint32_t pb,uint32_t gx,uint32_t gy,uint32_t gz){
+        Kernel kr; kr.create(c,sh[si].data(),sh[si].size(),(int)bufs.size(),pb);
+        VkDescriptorSet ds=kr.makeSet(c,bufs); VkCommandBuffer cmd=c.beginCmd();
+        kr.record(cmd,ds,push,gx,gy,gz); c.endCmd(cmd); kr.destroy(c); };
+    // push-структуры
+    struct GN{uint32_t C,HW,G;float e;}; struct CV{uint32_t Ci,Co,H,W,KH,KW,pad;};
+    struct AB{uint32_t C,HW;}; struct AB2{uint32_t n,C;}; struct T2{uint32_t a,b;};
+    struct LN{uint32_t tok,C;float e;}; struct MM{uint32_t M,N,K;}; struct SH{uint32_t seq,nh,d;};
+    struct AT{uint32_t sQ,sK,d,H;float sc;}; struct N1{uint32_t n;}; struct GG{uint32_t tok,C2;};
+    uint32_t g_chw=(C*HW+255)/256, g_tok=(HW*C+255)/256;
+    auto MMrun=[&](Buf* AA,Buf* BB,Buf* CC,uint32_t M,uint32_t N,uint32_t K){ MM m{M,N,K}; op(6,{AA,BB,CC},&m,12,(N+127)/128,(M+127)/128,1); };
+
+    // --- граф ---
+    { GN gn{(uint32_t)C,HW,32,1e-5f}; op(0,{&bx,&gnw,&gnb,&g1},&gn,16,32,1,1); }     // groupnorm
+    { CV cv{(uint32_t)C,(uint32_t)C,(uint32_t)H,(uint32_t)W,1,1,0}; op(1,{&g1,&pinw,&p1},&cv,28,((uint32_t)W+15)/16,((uint32_t)H+15)/16,(uint32_t)C); } // proj_in conv1x1
+    { AB ab{(uint32_t)C,HW}; op(2,{&p1,&pinb},&ab,8,g_chw,1,1); }
+    { T2 tr{(uint32_t)C,HW}; op(4,{&p1,&t},&tr,8,g_chw,1,1); }                        // [C,HW]→[HW,C]
+    // self-attn
+    { LN ln{HW,(uint32_t)C,1e-5f}; op(5,{&t,&n1w,&n1b,&h},&ln,12,HW,1,1); }
+    MMrun(&h,&q1,&q,HW,(uint32_t)C,(uint32_t)C); MMrun(&h,&k1,&k,HW,(uint32_t)C,(uint32_t)C); MMrun(&h,&v1,&v,HW,(uint32_t)C,(uint32_t)C);
+    { SH s{HW,(uint32_t)nh,d}; op(7,{&q,&qh},&s,12,(nh*HW*d+255)/256,1,1); op(7,{&k,&kh},&s,12,(nh*HW*d+255)/256,1,1); op(7,{&v,&vh},&s,12,(nh*HW*d+255)/256,1,1); }
+    { AT at{HW,HW,d,(uint32_t)nh,1.0f/sqrtf((float)d)}; op(8,{&qh,&kh,&vh,&ah},&at,20,(HW+63)/64,(uint32_t)nh,1); }
+    { SH s{HW,(uint32_t)nh,d}; op(9,{&ah,&a},&s,12,(nh*HW*d+255)/256,1,1); }          // merge
+    { Buf ao=A(HW*C); MMrun(&a,&o1,&ao,HW,(uint32_t)C,(uint32_t)C); AB2 ab{HW*(uint32_t)C,(uint32_t)C}; op(3,{&ao,&o1b},&ab,8,g_tok,1,1);
+      N1 n{HW*(uint32_t)C}; op(10,{&t,&ao,&t},&n,4,g_tok,1,1); c.free(ao); }          // t += to_out(attn)
+    // cross-attn
+    { LN ln{HW,(uint32_t)C,1e-5f}; op(5,{&t,&n2w,&n2b,&h},&ln,12,HW,1,1); }
+    MMrun(&h,&q2,&q,HW,(uint32_t)C,(uint32_t)C);
+    MMrun(&bctx,&k2,&kc,(uint32_t)ctxN,(uint32_t)C,(uint32_t)ctxD); MMrun(&bctx,&v2,&vc,(uint32_t)ctxN,(uint32_t)C,(uint32_t)ctxD);
+    { SH s{HW,(uint32_t)nh,d}; op(7,{&q,&qh},&s,12,(nh*HW*d+255)/256,1,1); }
+    { SH s{(uint32_t)ctxN,(uint32_t)nh,d}; op(7,{&kc,&khc},&s,12,(nh*ctxN*d+255)/256,1,1); op(7,{&vc,&vhc},&s,12,(nh*ctxN*d+255)/256,1,1); }
+    { AT at{HW,(uint32_t)ctxN,d,(uint32_t)nh,1.0f/sqrtf((float)d)}; op(8,{&qh,&khc,&vhc,&ah},&at,20,(HW+63)/64,(uint32_t)nh,1); }
+    { SH s{HW,(uint32_t)nh,d}; op(9,{&ah,&a},&s,12,(nh*HW*d+255)/256,1,1); }
+    { Buf ao=A(HW*C); MMrun(&a,&o2,&ao,HW,(uint32_t)C,(uint32_t)C); AB2 ab{HW*(uint32_t)C,(uint32_t)C}; op(3,{&ao,&o2b},&ab,8,g_tok,1,1);
+      N1 n{HW*(uint32_t)C}; op(10,{&t,&ao,&t},&n,4,g_tok,1,1); c.free(ao); }
+    // ff (GEGLU)
+    { LN ln{HW,(uint32_t)C,1e-5f}; op(5,{&t,&n3w,&n3b,&h},&ln,12,HW,1,1); }
+    MMrun(&h,&ggw,&gg,HW,PROJ,(uint32_t)C);
+    { AB2 ab{HW*PROJ,PROJ}; op(3,{&gg,&ggb},&ab,8,(HW*PROJ+255)/256,1,1); }
+    { GG gge{HW,C2}; op(12,{&gg,&gf},&gge,8,(HW*C2+255)/256,1,1); }                   // geglu combine
+    MMrun(&gf,&fow,&ff,HW,(uint32_t)C,C2);
+    { AB2 ab{HW*(uint32_t)C,(uint32_t)C}; op(3,{&ff,&fob},&ab,8,g_tok,1,1);
+      N1 n{HW*(uint32_t)C}; op(10,{&t,&ff,&t},&n,4,g_tok,1,1); }
+    // proj_out + residual
+    { T2 tr{HW,(uint32_t)C}; op(11,{&t,&tt},&tr,8,g_tok,1,1); }                       // [HW,C]→[C,HW]
+    { CV cv{(uint32_t)C,(uint32_t)C,(uint32_t)H,(uint32_t)W,1,1,0}; op(1,{&tt,&poutw,&po},&cv,28,((uint32_t)W+15)/16,((uint32_t)H+15)/16,(uint32_t)C); }
+    { AB ab{(uint32_t)C,HW}; op(2,{&po,&poutb},&ab,8,g_chw,1,1); }
+    { N1 n{(uint32_t)C*HW}; op(10,{&bx,&po,&out},&n,4,g_chw,1,1); }
+
+    std::vector<__fp16> hy((size_t)C*HW); c.download(out,hy.data(),(VkDeviceSize)C*HW*2);
+    double se=0,sr=0; for(uint32_t i=0;i<(uint32_t)C*HW;i+=53){ se+=fabsf((float)yref[i]-(float)hy[i]); sr+=fabsf((float)yref[i]); }
+    double e=se/(sr+1e-6); LOG("TRANSFORMER C%d %dx%d corr=%.4f %s",C,H,W,e,e<0.06?"OK(fp16)":"FAIL");
+    c.destroy(); return e;
+}
+
 // ====================== JNI: ATTENTION ======================
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_example_generet_1image_1ai_sd_VulkanBench_benchAttention(

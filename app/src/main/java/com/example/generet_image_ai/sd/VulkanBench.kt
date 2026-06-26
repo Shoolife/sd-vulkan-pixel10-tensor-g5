@@ -14,6 +14,22 @@ object VulkanBench {
     external fun benchGroupNorm(spirv: ByteArray, c: Int, hw: Int, g: Int, iters: Int): Double
     external fun benchAttention(spirv: ByteArray, h: Int, seqQ: Int, seqK: Int, d: Int, iters: Int): Double
     external fun runResnetBlock(shaders: Array<ByteArray>, weights: Array<ByteArray>, c: Int, h: Int, w: Int, temb: Int): Double
+    external fun runTransformerBlock(shaders: Array<ByteArray>, weights: Array<ByteArray>, c: Int, h: Int, w: Int, ctxN: Int, ctxD: Int, nh: Int): Double
+
+    fun transformerCheck(ctx: Context): String {
+        fun sh(n: String) = ctx.assets.open("shaders/$n.spv").use { it.readBytes() }
+        fun wt(n: String) = ctx.assets.open("tf/$n.bin").use { it.readBytes() }
+        val shaders = arrayOf(sh("groupnorm"), sh("conv2d"), sh("addbias"), sh("addbias2"), sh("t_chw2hwc"),
+            sh("layernorm"), sh("matmul"), sh("split_heads"), sh("attention"), sh("merge_heads"), sh("add"), sh("t_hwc2chw"), sh("geglu"))
+        val weights = arrayOf(
+            wt("x"), wt("ctx"), wt("gn_w"), wt("gn_b"), wt("pin_w"), wt("pin_b"), wt("n1_w"), wt("n1_b"),
+            wt("q1"), wt("k1"), wt("v1"), wt("o1"), wt("o1_b"), wt("n2_w"), wt("n2_b"),
+            wt("q2"), wt("k2"), wt("v2"), wt("o2"), wt("o2_b"), wt("n3_w"), wt("n3_b"),
+            wt("geglu"), wt("geglu_b"), wt("ffout"), wt("ffout_b"), wt("pout_w"), wt("pout_b"), wt("y"),
+        )
+        val err = runTransformerBlock(shaders, weights, 320, 64, 64, 77, 768, 8)
+        return "Transformer блок vs PyTorch: relErr=${"%.4f".format(err)} ${if (err < 0.06) "OK(fp16)" else "FAIL"}"
+    }
 
     fun resnetCheck(ctx: Context): String {
         fun sh(n: String) = ctx.assets.open("shaders/$n.spv").use { it.readBytes() }
@@ -53,6 +69,7 @@ object VulkanBench {
         sb.appendLine("self-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 4096, 40, 5))} ms")
         sb.appendLine("cross-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 77, 40, 5))} ms")
         sb.appendLine(resnetCheck(context))   // сборка ResNet блока + сверка с PyTorch
+        sb.appendLine(transformerCheck(context))  // сборка Transformer блока + сверка
         val res = sb.toString().trim()
         Log.d("VulkanBench", res)
         return res
