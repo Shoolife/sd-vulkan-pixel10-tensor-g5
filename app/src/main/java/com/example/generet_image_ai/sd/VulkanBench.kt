@@ -15,17 +15,16 @@ object VulkanBench {
     external fun benchAttention(spirv: ByteArray, h: Int, seqQ: Int, seqK: Int, d: Int, iters: Int): Double
     external fun runResnetBlock(shaders: Array<ByteArray>, weights: Array<ByteArray>, c: Int, h: Int, w: Int, temb: Int): Double
     external fun runTransformerBlock(shaders: Array<ByteArray>, weights: Array<ByteArray>, c: Int, h: Int, w: Int, ctxN: Int, ctxD: Int, nh: Int): Double
-    external fun runUNetDown0(shaders: Array<ByteArray>, weightsDir: String): Double
+    external fun unetInit(shaders: Array<ByteArray>, weightsDir: String): Int
+    external fun unetForward(lat: ByteArray, temb: ByteArray, ctx: ByteArray): ByteArray
+    external fun unetRelease()
 
-    fun unetCheck(ctx: Context): String {
+    fun unetShaders(ctx: Context): Array<ByteArray> {
         fun sh(n: String) = ctx.assets.open("shaders/$n.spv").use { it.readBytes() }
-        // порядок = enum S в C++: GN,SILU,CONV,MM,AB,AB2,ADD,LN,SPLIT,ATTN,MERGE,GEGLU,T_CH,T_HC,UP
-        val shaders = arrayOf(sh("groupnorm"), sh("silu"), sh("conv2d"), sh("matmul"), sh("addbias"),
+        // порядок = enum S в C++
+        return arrayOf(sh("groupnorm"), sh("silu"), sh("conv2d"), sh("matmul"), sh("addbias"),
             sh("addbias2"), sh("add"), sh("layernorm"), sh("split_heads"), sh("attention"),
             sh("merge_heads"), sh("geglu"), sh("t_chw2hwc"), sh("t_hwc2chw"), sh("upsample"), sh("attention_big"))
-        val dir = java.io.File(ctx.getExternalFilesDir(null), "unet_w").absolutePath
-        val err = runUNetDown0(shaders, dir)
-        return "Полный UNet vs PyTorch: relErr=${"%.4f".format(err)} ${if (err in 0.0..0.15) "OK" else "FAIL"}"
     }
 
     fun transformerCheck(ctx: Context): String {
@@ -82,7 +81,6 @@ object VulkanBench {
         sb.appendLine("cross-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 77, 40, 5))} ms")
         sb.appendLine(resnetCheck(context))   // сборка ResNet блока + сверка с PyTorch
         sb.appendLine(transformerCheck(context))  // сборка Transformer блока + сверка
-        sb.appendLine(unetCheck(context))         // сборка UNet down[0] + сверка
         val res = sb.toString().trim()
         Log.d("VulkanBench", res)
         return res

@@ -326,7 +326,8 @@ namespace unet {
 // шейдеры по индексу (порядок задаёт Kotlin)
 enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, NSH };
 static VkCtx* C_; static std::vector<std::vector<uint8_t>>* SH_; static std::string DIR_;
-static std::map<std::string,Buf> WC_;  // кэш весов
+static std::map<std::string,Buf> WC_;  // кэш весов (персистентный)
+static std::vector<Buf> SCRATCH_;      // временные буферы forward (освобождаются после)
 
 static int64_t fsize(const std::string& p){ FILE* f=fopen(p.c_str(),"rb"); if(!f)return -1; fseek(f,0,SEEK_END); int64_t s=ftell(f); fclose(f); return s; }
 // загрузка веса по имени (lazy, device-local)
@@ -340,7 +341,7 @@ static Buf& W(const std::string& name){
     WC_[name]=b; return WC_[name];
 }
 static bool has(const std::string& name){ return fsize(DIR_+"/"+name+".bin")>0; }
-static Buf mk(VkDeviceSize bytes){ return C_->alloc(bytes,true); }
+static Buf mk(VkDeviceSize bytes){ Buf b=C_->alloc(bytes,true); SCRATCH_.push_back(b); return b; }
 static void op(int si,std::vector<Buf*> bufs,const void* push,uint32_t pb,uint32_t gx,uint32_t gy,uint32_t gz){
     Kernel k; k.create(*C_,(*SH_)[si].data(),(*SH_)[si].size(),(int)bufs.size(),pb);
     VkDescriptorSet ds=k.makeSet(*C_,bufs); VkCommandBuffer cmd=C_->beginCmd();
@@ -393,7 +394,7 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
     matmul(h,W(b+".attn1.to_q.weight"),q,HW,Cc,Cc); matmul(h,W(b+".attn1.to_k.weight"),k,HW,Cc,Cc); matmul(h,W(b+".attn1.to_v.weight"),v,HW,Cc,Cc);
     split(q,qh,HW); split(k,kh,HW); split(v,vh,HW);
     { ATp p{HW,HW,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&kh,&vh,&ah},&p,20,(HW+63)/64,nh,1);}else{op(ATTN_BIG,{&qh,&kh,&vh,&ah},&p,20,(HW+15)/16,nh,1);} }
-    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*2); matmul(a,W(b+".attn1.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn1.to_out.0.bias"),N,Cc); addv(t,ao,t,N); C_->free(ao); }
+    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*2); matmul(a,W(b+".attn1.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn1.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
     // cross-attn
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm2.weight"),&W(b+".norm2.bias"),&h},&p,12,HW,1,1); }
     matmul(h,W(b+".attn2.to_q.weight"),q,HW,Cc,Cc);
@@ -401,7 +402,7 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
     matmul(ctx,W(b+".attn2.to_k.weight"),kc,ctxN,Cc,768); matmul(ctx,W(b+".attn2.to_v.weight"),vc,ctxN,Cc,768);
     split(q,qh,HW); split(kc,khc,ctxN); split(vc,vhc,ctxN);
     { ATp p{HW,ctxN,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&khc,&vhc,&ah},&p,20,(HW+63)/64,nh,1);}else{op(ATTN_BIG,{&qh,&khc,&vhc,&ah},&p,20,(HW+15)/16,nh,1);} }
-    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*2); matmul(a,W(b+".attn2.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn2.to_out.0.bias"),N,Cc); addv(t,ao,t,N); C_->free(ao); }
+    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*2); matmul(a,W(b+".attn2.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn2.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
     // ff GEGLU
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm3.weight"),&W(b+".norm3.bias"),&h},&p,12,HW,1,1); }
     Buf gg=mk((VkDeviceSize)HW*PROJ*2); matmul(h,W(b+".ff.net.0.proj.weight"),gg,HW,PROJ,Cc); addbias_l(gg,W(b+".ff.net.0.proj.bias"),HW*PROJ,PROJ);
@@ -438,36 +439,16 @@ static double corrCheck(Buf& got, const std::string& refName, uint32_t n){
     double se=0,sr=0; for(uint32_t i=0;i<n;i+=17){ se+=fabsf((float)ref[i]-(float)hy[i]); sr+=fabsf((float)ref[i]); }
     return se/(sr+1e-6);
 }
-} // namespace unet
-
-extern "C" JNIEXPORT jdouble JNICALL
-Java_com_example_generet_1image_1ai_sd_VulkanBench_runUNetDown0(
-        JNIEnv* env, jobject, jobjectArray shaders, jstring dir) {
-    using namespace unet;
-    VkCtx c; if(!c.init()) return -1; C_=&c;
-    static std::vector<std::vector<uint8_t>> sh; sh.assign(NSH,{});
-    for (int i=0;i<NSH;i++){ jbyteArray e=(jbyteArray)env->GetObjectArrayElement(shaders,i);
-        jsize l=env->GetArrayLength(e); sh[i].resize(l); env->GetByteArrayRegion(e,0,l,(jbyte*)sh[i].data()); }
-    SH_=&sh;
-    const char* cd=env->GetStringUTFChars(dir,nullptr); DIR_=cd; env->ReleaseStringUTFChars(dir,cd);
-    WC_.clear();
-    LOG("UNET dir=%s  IN_lat.bin size=%lld", DIR_.c_str(), (long long)fsize(DIR_+"/IN_lat.bin"));
-
-    // вход
-    auto load=[&](const std::string& nm, uint32_t n){ Buf b=mk((VkDeviceSize)n*2);
-        std::string p=DIR_+"/"+nm+".bin"; FILE* f=fopen(p.c_str(),"rb");
-        if(!f){ LOG("FOPEN FAIL %s errno=%d",p.c_str(),errno); return b; }
-        std::vector<uint8_t> v((size_t)n*2); fread(v.data(),1,v.size(),f); fclose(f); c.upload(b,v.data(),v.size()); return b; };
-    Buf lat=load("IN_lat",4*64*64), ctx=load("IN_ctx",77*768), tembp=load("IN_temb_proj",320);
-    // time embedding MLP: linear_1(320→1280)+silu+linear_2(1280→1280)
+// Полный UNet forward: lat[4,64,64], tembProj[320], ctx[77,768] → noise[4,64,64].
+// Использует persistent веса (WC_) и scratch (SCRATCH_).
+static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
+    // time embedding MLP
     Buf t1=mk(1280*2); matmul(tembp,W("time_embedding.linear_1.weight"),t1,1,1280,320); addbias_l(t1,W("time_embedding.linear_1.bias"),1280,1280); silu(t1,1280);
     Buf temb=mk(1280*2); matmul(t1,W("time_embedding.linear_2.weight"),temb,1,1280,1280); addbias_l(temb,W("time_embedding.linear_2.bias"),1280,1280);
-    LOG("UNET temb corr=%.4f",corrCheck(temb,"INT_temb",1280));
     // conv_in: 4→320
     Buf x=mk((VkDeviceSize)320*64*64*2); conv(lat,W("conv_in.weight"),x,4,320,64,64,3,1,1); addbias_c(x,W("conv_in.bias"),320,64*64);
     std::vector<Buf> skips; skips.push_back(x);
     uint32_t bo[4]={320,640,1280,1280};
-    auto P=[&](const char*f,int i,const char*s){ char buf[64]; snprintf(buf,64,f,i,s); return std::string(buf); };
     // ---- DOWN ----
     uint32_t Cprev=320, H=64;
     for (int i=0;i<4;i++){
@@ -481,12 +462,12 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runUNetDown0(
         }
         if (i<3){ snprintf(pre,48,"down_blocks.%d.downsamplers.0",i); x=downsample(pre,x,Cout,H,H); H/=2; skips.push_back(x); }
     }
-    LOG("UNET down done H=%d C=%d skips=%zu",H,Cprev,skips.size());
+    LOG("GRAPH down done H=%d C=%d",H,Cprev);
     // ---- MID ---- (1280, 8×8): resnet+transformer+resnet
     x=resnet("mid_block.resnets.0",x,temb,1280,1280,H,H);
     x=transformer("mid_block.attentions.0",x,ctx,1280,H,H,8);
     x=resnet("mid_block.resnets.1",x,temb,1280,1280,H,H);
-    double e_mid=corrCheck(x,"INT_mid",1280*H*H); LOG("UNET mid corr=%.4f",e_mid);
+    LOG("GRAPH mid done");
     // ---- UP ---- up[i]: 3 resnet (cat skip), attn (кроме up0), upsample (кроме up3)
     uint32_t upout[4]={1280,640,320,320};
     for (int i=0;i<4;i++){
@@ -500,17 +481,56 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runUNetDown0(
             uint32_t Cin=Cprev+Cskip;
             Buf cc=concat(x,Cprev,skip,Cskip,H*H);
             snprintf(pre,48,"up_blocks.%d.resnets.%d",i,r);
-            x=resnet(pre,cc,temb,Cin,Cout,H,H); Cprev=Cout; C_->free(cc);
+            x=resnet(pre,cc,temb,Cin,Cout,H,H); Cprev=Cout;
             if (attn){ snprintf(pre,48,"up_blocks.%d.attentions.%d",i,r); x=transformer(pre,x,ctx,Cout,H,H,8); }
         }
         if (up){ snprintf(pre,48,"up_blocks.%d.upsamplers.0",i); x=upsample(pre,x,Cout,H,H); H*=2; }
     }
-    LOG("UNET up done H=%d C=%d",H,Cprev);
+    LOG("GRAPH up done H=%d",H);
     // ---- OUT ---- groupnorm+silu+conv_out(320→4)
     Buf gno=mk((VkDeviceSize)320*H*H*2); groupnorm(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H); silu(gno,320*H*H);
     Buf y=mk((VkDeviceSize)4*H*H*2); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,H*H);
-    double e=corrCheck(y,"OUT_y",4*64*64); LOG("UNET FULL corr=%.4f %s",e,e<0.15?"OK":"FAIL");
-    c.destroy(); return e;
+    return y;
+}
+static VkCtx gCtx; static bool gInit=false;
+static std::vector<std::vector<uint8_t>> gSh;
+} // namespace unet
+
+// init: persistent ctx + shaders + dir (веса lazy)
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_unetInit(
+        JNIEnv* env, jobject, jobjectArray shaders, jstring dir) {
+    using namespace unet;
+    if (gInit) return 0;
+    if(!gCtx.init()) return -1; C_=&gCtx;
+    gSh.assign(NSH,{});
+    for (int i=0;i<NSH;i++){ jbyteArray e=(jbyteArray)env->GetObjectArrayElement(shaders,i);
+        jsize l=env->GetArrayLength(e); gSh[i].resize(l); env->GetByteArrayRegion(e,0,l,(jbyte*)gSh[i].data()); }
+    SH_=&gSh;
+    const char* cd=env->GetStringUTFChars(dir,nullptr); DIR_=cd; env->ReleaseStringUTFChars(dir,cd);
+    gInit=true; LOG("UNET init OK"); return 0;
+}
+
+// forward: latFp16[4*64*64*2], tembFp16[320*2], ctxFp16[77*768*2] → noiseFp16[4*64*64*2]
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_unetForward(
+        JNIEnv* env, jobject, jbyteArray latB, jbyteArray tembB, jbyteArray ctxB) {
+    using namespace unet; if(!gInit) return nullptr;
+    auto up=[&](jbyteArray a, uint32_t n){ Buf b=mk((VkDeviceSize)n*2); jsize l=env->GetArrayLength(a);
+        std::vector<uint8_t> v(l); env->GetByteArrayRegion(a,0,l,(jbyte*)v.data()); gCtx.upload(b,v.data(),v.size()); return b; };
+    Buf lat=up(latB,4*64*64), temb=up(tembB,320), ctx=up(ctxB,77*768);
+    Buf noise=runGraph(lat,temb,ctx);
+    std::vector<uint8_t> out((size_t)4*64*64*2); gCtx.download(noise,out.data(),out.size());
+    jbyteArray res=env->NewByteArray((jsize)out.size()); env->SetByteArrayRegion(res,0,(jsize)out.size(),(jbyte*)out.data());
+    for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();   // освобождаем временные, веса остаются
+    return res;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_unetRelease(JNIEnv*, jobject) {
+    using namespace unet; if(!gInit) return;
+    for (auto& kv: WC_) gCtx.free(kv.second); WC_.clear();
+    gCtx.destroy(); gInit=false;
 }
 
 // ====================== JNI: TRANSFORMER BLOCK ======================

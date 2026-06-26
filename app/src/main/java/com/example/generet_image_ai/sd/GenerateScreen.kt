@@ -44,9 +44,9 @@ fun GenerateScreen(
             modifier = Modifier.fillMaxWidth(),
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(selected = s.engine == Engine.MEDIAPIPE, enabled = !s.running, onClick = { vm.setEngine(Engine.MEDIAPIPE) }, label = { Text("MediaPipe") })
+            FilterChip(selected = s.engine == Engine.VULKAN, enabled = !s.running, onClick = { vm.setEngine(Engine.VULKAN) }, label = { Text("Свой Vulkan") })
             FilterChip(selected = s.engine == Engine.GPU_LCM, enabled = !s.running, onClick = { vm.setEngine(Engine.GPU_LCM) }, label = { Text("GPU·LCM") })
-            FilterChip(selected = s.engine == Engine.TPU, enabled = !s.running, onClick = { vm.setEngine(Engine.TPU) }, label = { Text("TPU") })
+            FilterChip(selected = s.engine == Engine.MEDIAPIPE, enabled = !s.running, onClick = { vm.setEngine(Engine.MEDIAPIPE) }, label = { Text("MediaPipe") })
         }
         Button(onClick = vm::generate, enabled = !s.running, modifier = Modifier.fillMaxWidth()) {
             Text(if (s.running) "Генерация…" else "Сгенерировать")

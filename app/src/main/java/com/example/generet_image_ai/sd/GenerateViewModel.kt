@@ -13,12 +13,12 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-enum class Engine { GPU_LCM, TPU, MEDIAPIPE }
+enum class Engine { GPU_LCM, TPU, MEDIAPIPE, VULKAN }
 
 data class GenUiState(
     val prompt: String = "a photograph of an astronaut riding a horse",
-    val engine: Engine = Engine.MEDIAPIPE,  // бенчмарк нативного движка Google
-    val steps: Int = 20,          // MediaPipe: 20 шагов ~15с (бенчмарк Google)
+    val engine: Engine = Engine.VULKAN,  // свой Vulkan UNet-движок
+    val steps: Int = 4,           // LCM: 4 шага
     val cfgScale: Float = 1.5f,
     val running: Boolean = false,
     val status: String = "Готов",
@@ -34,6 +34,7 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
 
     private val gpuPipe = GpuMonoPipeline(app)
     private val mpPipe = MediaPipePipeline(app)
+    private val vkPipe = VulkanUnetPipeline(app)
     private val tokenizer by lazy { ClipTokenizer(app) }
 
     fun setEngine(e: Engine) = _state.update { it.copy(engine = e) }
@@ -81,6 +82,12 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
                             val cond = tokenizer.encode(prompt); val uncond = tokenizer.encode("")
                             gpuPipe.generate(cond, uncond, steps = steps, cfgScale = cfg, seed = System.nanoTime(), lcm = true) { i, n ->
                                 _state.update { it.copy(status = "Денойз $i/$n (GPU·LCM)…") }
+                            }
+                        }
+                        Engine.VULKAN -> {
+                            val cond = tokenizer.encode(prompt)
+                            vkPipe.generate(cond, steps = steps, seed = System.nanoTime()) { i, n ->
+                                _state.update { it.copy(status = "Денойз $i/$n (свой Vulkan UNet)…") }
                             }
                         }
                     }
