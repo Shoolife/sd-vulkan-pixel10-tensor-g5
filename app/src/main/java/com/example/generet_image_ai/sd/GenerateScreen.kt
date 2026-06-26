@@ -1,0 +1,62 @@
+package com.example.generet_image_ai.sd
+
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+
+@Composable
+fun GenerateScreen(
+    modifier: Modifier = Modifier,
+    vm: GenerateViewModel = viewModel(),
+) {
+    val s by vm.state.collectAsState()
+    Column(
+        modifier = modifier.fillMaxWidth().padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("Generet AI · SD1.5 на TPU", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Text(
+            "Промпт (демо): «a photograph of an astronaut riding a horse». " +
+                "Модели CLIP+UNet(×3)+VAE скомпилированы под Tensor G5.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = s.useNpu, enabled = !s.running, onClick = { vm.setNpu(true) }, label = { Text("TPU / NPU") })
+            FilterChip(selected = !s.useNpu, enabled = !s.running, onClick = { vm.setNpu(false) }, label = { Text("GPU") })
+        }
+        Button(onClick = vm::generate, enabled = !s.running, modifier = Modifier.fillMaxWidth()) {
+            Text(if (s.running) "Генерация…" else "Сгенерировать")
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (s.running) CircularProgressIndicator(modifier = Modifier.padding(2.dp))
+            Text(s.status, style = MaterialTheme.typography.bodyMedium)
+        }
+        if (s.elapsedMs > 0) {
+            Text("⏱ ${"%.1f".format(s.elapsedMs / 1000.0)} c на картинку", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+        }
+        s.image?.let { bmp ->
+            Card(Modifier.fillMaxWidth()) {
+                Image(bitmap = bmp.asImageBitmap(), contentDescription = "результат", modifier = Modifier.fillMaxWidth().aspectRatio(1f))
+            }
+        }
+    }
+}
