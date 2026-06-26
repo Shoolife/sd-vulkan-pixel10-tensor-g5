@@ -1,57 +1,56 @@
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-// Flash-attention v2 с тайлингом: workgroup из 64 потоков обрабатывает 64 query-строки
-// одной головы. K/V грузятся блоками по 64 в shared (переиспользование всеми потоками).
-// Layout Q/K/V/O [H, seq, d]. d <= 128 (для shared). seq self-attn d=40 → влезает.
+// Flash-attention v2, vec4. Оптимизирован для d<=40 (главный боттлнек self-attn 64²).
+// q/acc компактные [MAXDD] vec4 (не [128]) → нет register spill. Векторный dot.
 #define BT 64
-#define MAXD 128
+#define MAXDD 10           // d/4, d<=40
 layout(local_size_x = BT) in;
-layout(set=0,binding=0) readonly buffer BQ { float16_t Q[]; };
-layout(set=0,binding=1) readonly buffer BK { float16_t K[]; };
-layout(set=0,binding=2) readonly buffer BV { float16_t V[]; };
-layout(set=0,binding=3) writeonly buffer BO { float16_t O[]; };
+layout(set=0,binding=0) readonly buffer BQ { f16vec4 Q[]; };
+layout(set=0,binding=1) readonly buffer BK { f16vec4 K[]; };
+layout(set=0,binding=2) readonly buffer BV { f16vec4 V[]; };
+layout(set=0,binding=3) writeonly buffer BO { f16vec4 O[]; };
 layout(push_constant) uniform P { uint seqQ, seqK, d, H; float scale; } p;
 
-shared float16_t Ks[BT][MAXD];
-shared float16_t Vs[BT][MAXD];
+shared f16vec4 Ks[BT][MAXDD];
+shared f16vec4 Vs[BT][MAXDD];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint i = gl_WorkGroupID.x * BT + tid;   // строка запроса
-    uint h = gl_WorkGroupID.y;              // голова
+    uint i = gl_WorkGroupID.x * BT + tid;
+    uint h = gl_WorkGroupID.y;
+    uint dd = p.d >> 2;                 // векторов на строку
     bool inrange = (i < p.seqQ) && (h < p.H);
 
-    float q[MAXD];
-    uint qBase = (h*p.seqQ + i)*p.d;
-    if (inrange) for (uint k=0u;k<p.d;k++) q[k]=float(Q[qBase+k]);
+    f16vec4 q[MAXDD];
+    uint qv = (h*p.seqQ + i)*dd;        // в единицах vec4
+    if (inrange) for (uint k=0u;k<dd;k++) q[k]=Q[qv+k];
 
-    float acc[MAXD];
-    for (uint k=0u;k<p.d;k++) acc[k]=0.0;
+    vec4 acc[MAXDD];
+    for (uint k=0u;k<dd;k++) acc[k]=vec4(0.0);
     float m=-3.0e38, l=0.0;
-    uint hkBase = h*p.seqK*p.d;
+    uint hkv = h*p.seqK*dd;
 
-    // цикл по блокам ключей
     for (uint kb=0u; kb<p.seqK; kb+=BT) {
-        // кооперативная загрузка блока K,V в shared (каждый поток грузит свою строку)
         uint jg = kb + tid;
-        if (jg < p.seqK) for (uint k=0u;k<p.d;k++){ Ks[tid][k]=K[hkBase+jg*p.d+k]; Vs[tid][k]=V[hkBase+jg*p.d+k]; }
+        if (jg < p.seqK) for (uint k=0u;k<dd;k++){ Ks[tid][k]=K[hkv+jg*dd+k]; Vs[tid][k]=V[hkv+jg*dd+k]; }
         barrier();
         if (inrange) {
-            uint cnt = min(BT, p.seqK-kb);
+            uint cnt = min(uint(BT), p.seqK-kb);
             for (uint jj=0u; jj<cnt; jj++) {
-                float s=0.0; for (uint k=0u;k<p.d;k++) s += q[k]*float(Ks[jj][k]);
+                float s=0.0;
+                for (uint k=0u;k<dd;k++) s += dot(vec4(q[k]), vec4(Ks[jj][k]));
                 s *= p.scale;
                 float mnew=max(m,s); float corr=exp(m-mnew); float pj=exp(s-mnew);
                 l = l*corr + pj;
-                for (uint k=0u;k<p.d;k++) acc[k]=acc[k]*corr + pj*float(Vs[jj][k]);
+                for (uint k=0u;k<dd;k++) acc[k]=acc[k]*corr + pj*vec4(Vs[jj][k]);
                 m=mnew;
             }
         }
         barrier();
     }
     if (inrange) {
-        uint oBase=(h*p.seqQ+i)*p.d; float invl=1.0/l;
-        for (uint k=0u;k<p.d;k++) O[oBase+k]=float16_t(acc[k]*invl);
+        uint ov=(h*p.seqQ+i)*dd; float invl=1.0/l;
+        for (uint k=0u;k<dd;k++) O[ov+k]=f16vec4(acc[k]*invl);
     }
 }
