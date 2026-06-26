@@ -7,17 +7,30 @@ import android.util.Log
 object VulkanBench {
     init { System.loadLibrary("vkbench") }
 
-    /** matmul C[M,N]=A[M,K]*B[K,N] fp32 на GPU, возвращает GFLOPS (среднее по iters). */
     external fun benchMatmul(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
+    external fun benchConv(spirv: ByteArray, cin: Int, cout: Int, h: Int, w: Int, kh: Int, kw: Int, iters: Int): Double
 
     fun run(context: Context): String {
-        val spv = context.assets.open("shaders/matmul.spv").use { it.readBytes() }
+        val mm = context.assets.open("shaders/matmul.spv").use { it.readBytes() }
+        val cv = context.assets.open("shaders/conv2d.spv").use { it.readBytes() }
         val sb = StringBuilder()
-        for (sz in intArrayOf(512, 1024, 2048)) {
-            val g = benchMatmul(spv, sz, sz, sz, 20)
-            val line = "matmul ${sz}³: ${"%.0f".format(g)} GFLOPS"
-            Log.d("VulkanBench", line); sb.appendLine(line)
+        // matmul (регрессия фундамента)
+        for (sz in intArrayOf(1024, 2048)) {
+            val g = benchMatmul(mm, sz, sz, sz, 20)
+            sb.appendLine("matmul ${sz}³: ${"%.0f".format(g)} GFLOPS")
         }
-        return sb.toString().trim()
+        // conv2d на реальных слоях SD UNet (512×512 → латент 64×64, каналы 320/640/1280)
+        val convs = arrayOf(
+            intArrayOf(320, 320, 64, 64, 3, 3),
+            intArrayOf(640, 640, 32, 32, 3, 3),
+            intArrayOf(1280, 1280, 16, 16, 3, 3),
+        )
+        for (c in convs) {
+            val g = benchConv(cv, c[0], c[1], c[2], c[3], c[4], c[5], 10)
+            sb.appendLine("conv ${c[0]}→${c[1]} ${c[2]}²: ${"%.0f".format(g)} GFLOPS")
+        }
+        val res = sb.toString().trim()
+        Log.d("VulkanBench", res)
+        return res
     }
 }
