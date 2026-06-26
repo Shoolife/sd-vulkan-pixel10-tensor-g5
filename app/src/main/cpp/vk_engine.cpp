@@ -201,6 +201,60 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmul(
     return g;
 }
 
+// ====================== JNI: SILU ======================
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_benchSilu(
+        JNIEnv* env, jobject, jbyteArray spirv, jint n, jint iters) {
+    VkCtx c; if(!c.init()) return -1;
+    jsize l=env->GetArrayLength(spirv); std::vector<uint8_t> spv(l); env->GetByteArrayRegion(spirv,0,l,(jbyte*)spv.data());
+    VkDeviceSize sz=(VkDeviceSize)n*2; Buf bX=c.alloc(sz,true), bY=c.alloc(sz,true);
+    std::vector<__fp16> hX(n); for(int i=0;i<n;i++) hX[i]=(__fp16)(((i*131u+7u)%37u)*0.1f-1.8f);
+    c.upload(bX,hX.data(),sz);
+    Kernel k; k.create(c,spv.data(),spv.size(),2,4); VkDescriptorSet ds=k.makeSet(c,{&bX,&bY});
+    uint32_t pc=(uint32_t)n; uint32_t gx=((uint32_t)n+255)/256;
+    { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,&pc,gx,1,1); c.endCmd(cmd); }
+    { std::vector<__fp16> hY(n); c.download(bY,hY.data(),sz); double se=0,sr=0;
+      for(int s=0;s<32;s++){ int i=(s*131+5)%n; float x=(float)hX[i]; float ref=x/(1.0f+expf(-x));
+        se+=fabsf(ref-(float)hY[i]); sr+=fabsf(ref);} double e=se/(sr+1e-6);
+      LOG("SILU n%d corr=%.4f %s",n,e,e<0.02?"OK":"FAIL"); }
+    double sec=timeDispatch(c,k,ds,&pc,gx,1,1,iters);
+    LOG("silu n%d: %.3f ms",n,sec*1000);
+    k.destroy(c); c.free(bX);c.free(bY); c.destroy(); return sec*1000;
+}
+
+// ====================== JNI: GROUPNORM ======================
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_benchGroupNorm(
+        JNIEnv* env, jobject, jbyteArray spirv, jint C, jint HW, jint G, jint iters) {
+    VkCtx c; if(!c.init()) return -1;
+    jsize l=env->GetArrayLength(spirv); std::vector<uint8_t> spv(l); env->GetByteArrayRegion(spirv,0,l,(jbyte*)spv.data());
+    VkDeviceSize szX=(VkDeviceSize)C*HW*2, szP=(VkDeviceSize)C*2;
+    Buf bX=c.alloc(szX,true), bG=c.alloc(szP,true), bB=c.alloc(szP,true), bY=c.alloc(szX,true);
+    std::vector<__fp16> hX((size_t)C*HW), hG(C), hB(C);
+    for(size_t i=0;i<hX.size();i++) hX[i]=(__fp16)(((i*131u+7u)%29u)*0.1f-1.4f);
+    for(int i=0;i<C;i++){ hG[i]=(__fp16)(0.8f+0.01f*(i%7)); hB[i]=(__fp16)(0.05f*(i%5)-0.1f); }
+    c.upload(bX,hX.data(),szX); c.upload(bG,hG.data(),szP); c.upload(bB,hB.data(),szP);
+    Kernel k; k.create(c,spv.data(),spv.size(),4,16); VkDescriptorSet ds=k.makeSet(c,{&bX,&bG,&bB,&bY});
+    struct { uint32_t C,HW,G; float eps; } pc{(uint32_t)C,(uint32_t)HW,(uint32_t)G,1e-5f};
+    uint32_t gx=(uint32_t)G;
+    { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,&pc,gx,1,1); c.endCmd(cmd); }
+    // верификация: пересчёт group-статистики на CPU
+    { std::vector<__fp16> hY((size_t)C*HW); c.download(bY,hY.data(),szX);
+      int cpg=C/G; int gs=cpg*HW; double se=0,sr=0;
+      for (int gi=0; gi<G; gi++){
+          double s=0,sq=0; int c0=gi*cpg;
+          for(int j=0;j<gs;j++){ int ch=c0+j/HW, off=j%HW; float v=(float)hX[(size_t)ch*HW+off]; s+=v; sq+=v*v; }
+          double mean=s/gs, var=sq/gs-mean*mean, inv=1.0/sqrt(var+1e-5);
+          for (int t=0;t<4;t++){ int j=(t*97+gi)%gs; int ch=c0+j/HW, off=j%HW;
+            float v=(float)hX[(size_t)ch*HW+off];
+            float ref=(float)((v-mean)*inv*(float)hG[ch]+(float)hB[ch]);
+            se+=fabsf(ref-(float)hY[(size_t)ch*HW+off]); sr+=fabsf(ref); } }
+      double e=se/(sr+1e-6); LOG("GROUPNORM C%d HW%d G%d corr=%.4f %s",C,HW,G,e,e<0.03?"OK":"FAIL"); }
+    double sec=timeDispatch(c,k,ds,&pc,gx,1,1,iters);
+    LOG("groupnorm C%d HW%d: %.3f ms",C,HW,sec*1000);
+    k.destroy(c); c.free(bX);c.free(bG);c.free(bB);c.free(bY); c.destroy(); return sec*1000;
+}
+
 // ====================== JNI: CONV через im2col + GEMM ======================
 // Принимает 2 SPIR-V: im2col и matmul. conv → Col[K,Ncol] → Y=W×Col.
 extern "C" JNIEXPORT jdouble JNICALL
