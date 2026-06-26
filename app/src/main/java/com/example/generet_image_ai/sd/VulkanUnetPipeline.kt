@@ -21,40 +21,15 @@ class VulkanUnetPipeline(private val context: Context) {
     private val dir = File(context.getExternalFilesDir(null), "models")
     private val latSize = 4 * 64 * 64
 
-    // float[] → fp16 little-endian bytes
-    private fun toFp16(f: FloatArray): ByteArray {
-        val bb = ByteBuffer.allocate(f.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-        for (v in f) bb.putShort(floatToHalf(v))
+    // float[] ↔ fp32 little-endian bytes (движок теперь fp32)
+    private fun toF32(f: FloatArray): ByteArray {
+        val bb = ByteBuffer.allocate(f.size * 4).order(ByteOrder.LITTLE_ENDIAN)
+        for (v in f) bb.putFloat(v)
         return bb.array()
     }
-    private fun fromFp16(b: ByteArray): FloatArray {
+    private fun fromF32(b: ByteArray): FloatArray {
         val bb = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
-        return FloatArray(b.size / 2) { halfToFloat(bb.short) }
-    }
-    private fun floatToHalf(v: Float): Short {
-        val bits = java.lang.Float.floatToIntBits(v)
-        val sign = (bits ushr 16) and 0x8000
-        var exp = ((bits ushr 23) and 0xff) - 127 + 15
-        val mant = bits and 0x7fffff
-        if (exp <= 0) return sign.toShort()
-        if (exp >= 0x1f) return (sign or 0x7c00).toShort()
-        return (sign or (exp shl 10) or (mant ushr 13)).toShort()
-    }
-    private fun halfToFloat(h: Short): Float {
-        val bits = h.toInt() and 0xffff
-        val sign = (bits and 0x8000) shl 16
-        val exp = (bits ushr 10) and 0x1f
-        val mant = bits and 0x3ff
-        val out = when {
-            exp == 0 -> if (mant == 0) sign else { // subnormal
-                var e = -1; var m = mant
-                do { e++; m = m shl 1 } while (m and 0x400 == 0)
-                sign or ((e + 127 - 15 + 1) shl 23) or ((m and 0x3ff) shl 13)
-            }
-            exp == 0x1f -> sign or 0x7f800000 or (mant shl 13)
-            else -> sign or ((exp - 15 + 127) shl 23) or (mant shl 13)
-        }
-        return java.lang.Float.intBitsToFloat(out)
+        return FloatArray(b.size / 4) { bb.float }
     }
 
     // sinusoidal time-embedding (diffusers get_timestep_embedding, dim=320, flip_sin_to_cos, shift=0)
@@ -85,16 +60,16 @@ class VulkanUnetPipeline(private val context: Context) {
         finally { inB.forEach { it.close() }; outB.forEach { it.close() }; m.close() }
     }
 
-    fun generate(condTokens: IntArray, steps: Int = 4, seed: Long = 42L,
-                 onStep: (Int, Int) -> Unit = { _, _ -> }): Bitmap {
-        // CLIP в своём env, закрываем ПОЛНОСТЬЮ перед нашим Vulkan UNet (иначе 2 GPU-контекста → OOM)
-        val ctxFp16: ByteArray
+    fun generate(condTokens: IntArray, uncondTokens: IntArray, steps: Int = 4, cfgScale: Float = 1.5f,
+                 seed: Long = 42L, onStep: (Int, Int) -> Unit = { _, _ -> }): Bitmap {
+        // CLIP cond+uncond в своём env, закрываем перед нашим UNet (иначе 2 GPU-контекста → OOM)
+        val condCtx: ByteArray; val uncondCtx: ByteArray
         run {
             val env = Environment.create()
-            try { ctxFp16 = toFp16(clipContext(condTokens, env)) } finally { env.close() }
+            try { condCtx = toF32(clipContext(condTokens, env)); uncondCtx = toF32(clipContext(uncondTokens, env)) }
+            finally { env.close() }
         }
         Log.d(tag, "clip done")
-        // наш Vulkan UNet (один GPU-контекст, 1.7ГБ весов)
         VulkanBench.unetInit(VulkanBench.unetShaders(context),
             File(context.getExternalFilesDir(null), "unet_w").absolutePath)
         Log.d(tag, "unet init")
@@ -103,8 +78,11 @@ class VulkanUnetPipeline(private val context: Context) {
         var latents = FloatArray(latSize) { gaussian(rnd) * sched.initialScale }
         for ((idx, t) in sched.timesteps.withIndex()) {
             onStep(idx, steps)
-            val noiseB = VulkanBench.unetForward(toFp16(latents), toFp16(timeProj(t)), ctxFp16)
-            val eps = fromFp16(noiseB)
+            val tembB = toF32(timeProj(t)); val latB = toF32(latents)
+            // CFG: 2 прогона batch=1 (наш UNet batch=1), eps = uncond + scale*(cond-uncond)
+            val cond = fromF32(VulkanBench.unetForward(latB, tembB, condCtx))
+            val uncond = fromF32(VulkanBench.unetForward(latB, tembB, uncondCtx))
+            val eps = FloatArray(latSize) { uncond[it] + cfgScale * (cond[it] - uncond[it]) }
             val noise = if (idx == steps - 1) null else FloatArray(latSize) { gaussian(rnd) }
             latents = sched.step(latents, eps, noise)
             Log.d(tag, "step ${idx + 1}/$steps done")

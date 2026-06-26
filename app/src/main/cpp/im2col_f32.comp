@@ -1,0 +1,24 @@
+#version 450
+// im2col: X[Cin,H,W] -> Col[K, Ncol], K=Cin*KH*KW, Ncol=H*W. 1 поток = 1 элемент Col.
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer BX { float X[]; };
+layout(set=0,binding=1) writeonly buffer BC { float Col[]; };
+layout(push_constant) uniform P { uint Cin,H,W,KH,KW,pad,Ncol,Kcol; } p;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = p.Kcol * p.Ncol;
+    if (idx >= total) return;
+    uint k = idx / p.Ncol;          // строка Col (ci,ky,kx)
+    uint n = idx % p.Ncol;          // столбец (oy,ox)
+    uint khkw = p.KH * p.KW;
+    uint ci = k / khkw; uint rem = k % khkw;
+    uint ky = rem / p.KW; uint kx = rem % p.KW;
+    uint oy = n / p.W; uint ox = n % p.W;
+    int iy = int(oy)+int(ky)-int(p.pad);
+    int ix = int(ox)+int(kx)-int(p.pad);
+    float v = float(0.0);
+    if (iy>=0 && iy<int(p.H) && ix>=0 && ix<int(p.W))
+        v = X[ci*p.H*p.W + uint(iy)*p.W + uint(ix)];
+    Col[idx] = v;
+}

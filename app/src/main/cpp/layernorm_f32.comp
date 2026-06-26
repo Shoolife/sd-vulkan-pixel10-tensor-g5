@@ -1,0 +1,18 @@
+#version 450
+layout(local_size_x=256) in;
+layout(set=0,binding=0) readonly buffer BX { float X[]; };
+layout(set=0,binding=1) readonly buffer BG { float gamma[]; };
+layout(set=0,binding=2) readonly buffer BB { float beta[]; };
+layout(set=0,binding=3) writeonly buffer BY { float Y[]; };
+layout(push_constant) uniform P { uint tok, C; float eps; } p;
+shared float ss[256]; shared float sq[256];
+void main(){
+    uint t=gl_WorkGroupID.x; uint tid=gl_LocalInvocationID.x; uint base=t*p.C;
+    float s=0.0,q=0.0;
+    for(uint c=tid;c<p.C;c+=256u){ float v=float(X[base+c]); s+=v; q+=v*v; }
+    ss[tid]=s; sq[tid]=q; barrier();
+    for(uint st=128u;st>0u;st>>=1u){ if(tid<st){ss[tid]+=ss[tid+st];sq[tid]+=sq[tid+st];} barrier(); }
+    float mean=ss[0]/float(p.C); float var=sq[0]/float(p.C)-mean*mean; float inv=inversesqrt(var+p.eps);
+    for(uint c=tid;c<p.C;c+=256u){ float v=float(X[base+c]);
+        Y[base+c]=float((v-mean)*inv*float(gamma[c])+float(beta[c])); }
+}

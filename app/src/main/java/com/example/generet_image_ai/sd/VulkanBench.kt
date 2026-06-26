@@ -18,6 +18,7 @@ object VulkanBench {
     external fun unetInit(shaders: Array<ByteArray>, weightsDir: String): Int
     external fun unetForward(lat: ByteArray, temb: ByteArray, ctx: ByteArray): ByteArray
     external fun unetRelease()
+    external fun unetSelfTest(): Double
 
     fun unetShaders(ctx: Context): Array<ByteArray> {
         fun sh(n: String) = ctx.assets.open("shaders/$n.spv").use { it.readBytes() }

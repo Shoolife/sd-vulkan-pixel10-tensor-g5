@@ -1,6 +1,4 @@
 #version 450
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 // fp16 storage, FP32 accumulate (как tensor cores) — точность + скорость.
 // workgroup 16×16, поток считает 8 строк × 2 vec4 (8×8=64 выхода). Тайл 128×128.
 #define BM 128
@@ -8,13 +6,13 @@
 #define BK 16
 #define TM 8
 layout(local_size_x = 16, local_size_y = 16) in;
-layout(set = 0, binding = 0) readonly buffer BufA { float16_t A[]; };
-layout(set = 0, binding = 1) readonly buffer BufB { f16vec4 B4[]; };
-layout(set = 0, binding = 2) writeonly buffer BufC { f16vec4 C4[]; };
+layout(set = 0, binding = 0) readonly buffer BufA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { vec4 B4[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { vec4 C4[]; };
 layout(push_constant) uniform Push { uint M, N, K; } p;
 
-shared float16_t As[BK][BM];
-shared f16vec4  Bs[BK][BN/4];
+shared float As[BK][BM];
+shared vec4  Bs[BK][BN/4];
 
 void main() {
     uint tid = gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x;
@@ -32,12 +30,12 @@ void main() {
         for (uint i = tid; i < BM*BK; i += 256u) {
             uint r = i / BK, c = i % BK;
             uint gr = blockRow + r, gc = t*BK + c;
-            As[c][r] = (gr < p.M && gc < p.K) ? A[gr*p.K + gc] : float16_t(0.0);
+            As[c][r] = (gr < p.M && gc < p.K) ? A[gr*p.K + gc] : float(0.0);
         }
         for (uint i = tid; i < BK*(BN/4u); i += 256u) {
             uint r = i / (BN/4u), c = i % (BN/4u);
             uint gr = t*BK + r; uint gcv = blockCol/4u + c;
-            Bs[r][c] = (gr < p.K && gcv < N4) ? B4[gr*N4 + gcv] : f16vec4(0.0);
+            Bs[r][c] = (gr < p.K && gcv < N4) ? B4[gr*N4 + gcv] : vec4(0.0);
         }
         barrier();
         for (uint k = 0u; k < BK; k++) {
@@ -49,6 +47,6 @@ void main() {
     for (int i=0;i<TM;i++){
         uint gr = blockRow + tr + i;
         uint cv=blockCol/4u + tcv;
-        if (gr < p.M){ if(cv<N4) C4[gr*N4 + cv]=f16vec4(acc0[i]); if(cv+1u<N4) C4[gr*N4 + cv+1u]=f16vec4(acc1[i]); }
+        if (gr < p.M){ if(cv<N4) C4[gr*N4 + cv]=vec4(acc0[i]); if(cv+1u<N4) C4[gr*N4 + cv+1u]=vec4(acc1[i]); }
     }
 }

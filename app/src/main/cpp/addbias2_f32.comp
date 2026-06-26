@@ -1,0 +1,6 @@
+#version 450
+layout(local_size_x=256) in;
+layout(set=0,binding=0) buffer BY { float Y[]; };
+layout(set=0,binding=1) readonly buffer BB { float B[]; };
+layout(push_constant) uniform P { uint n, C; } p;
+void main(){ uint i=gl_GlobalInvocationID.x; if(i>=p.n) return; Y[i]=float(float(Y[i])+float(B[i%p.C])); }

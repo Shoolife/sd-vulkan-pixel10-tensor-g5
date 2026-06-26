@@ -1,0 +1,14 @@
+#version 450
+layout(local_size_x=256) in;
+layout(set=0,binding=0) readonly buffer BG { float G[]; };
+layout(set=0,binding=1) writeonly buffer BO { float O[]; };
+layout(push_constant) uniform P { uint tok, C2; } p;
+// точный erf (Abramowitz-Stegun 7.1.26) → gelu = 0.5x(1+erf(x/√2)) как в PyTorch
+float erfa(float x){ float s=sign(x); x=abs(x); float t=1.0/(1.0+0.3275911*x);
+    float y=1.0-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*exp(-x*x);
+    return s*y; }
+void main(){ uint i=gl_GlobalInvocationID.x; if(i>=p.tok*p.C2) return;
+    uint t=i/p.C2, c=i%p.C2; uint base=t*2u*p.C2;
+    float a=float(G[base+c]); float b=float(G[base+p.C2+c]);
+    float gelu=0.5*b*(1.0+erfa(b*0.70710678));
+    O[i]=float(a*gelu); }

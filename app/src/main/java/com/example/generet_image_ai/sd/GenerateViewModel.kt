@@ -47,7 +47,13 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _state.update { it.copy(running = true, status = "Vulkan бенч…") }
             try {
-                val res = withContext(gpuDispatcher) { VulkanBench.run(app) }
+                val res = withContext(gpuDispatcher) {
+                    VulkanBench.unetInit(VulkanBench.unetShaders(app),
+                        java.io.File(app.getExternalFilesDir(null), "unet_w").absolutePath)
+                    val c = VulkanBench.unetSelfTest()
+                    VulkanBench.unetRelease()
+                    "UNet self-test fp32: relErr=${"%.4f".format(c)}"
+                }
                 _state.update { it.copy(running = false, status = res) }
             } catch (t: Throwable) {
                 android.util.Log.e("GenerateVM", "vk bench fail", t)
@@ -85,8 +91,8 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
                             }
                         }
                         Engine.VULKAN -> {
-                            val cond = tokenizer.encode(prompt)
-                            vkPipe.generate(cond, steps = steps, seed = System.nanoTime()) { i, n ->
+                            val cond = tokenizer.encode(prompt); val uncond = tokenizer.encode("")
+                            vkPipe.generate(cond, uncond, steps = steps, cfgScale = cfg, seed = System.nanoTime()) { i, n ->
                                 _state.update { it.copy(status = "Денойз $i/$n (свой Vulkan UNet)…") }
                             }
                         }

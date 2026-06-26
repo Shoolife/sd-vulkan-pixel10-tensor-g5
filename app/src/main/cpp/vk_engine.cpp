@@ -174,11 +174,11 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmul(
     jsize spvLen=env->GetArrayLength(spirv); std::vector<uint8_t> spv(spvLen);
     env->GetByteArrayRegion(spirv,0,spvLen,(jbyte*)spv.data());
 
-    VkDeviceSize szA=(VkDeviceSize)M*K*2, szB=(VkDeviceSize)K*N*2, szC=(VkDeviceSize)M*N*2;
+    VkDeviceSize szA=(VkDeviceSize)M*K*4, szB=(VkDeviceSize)K*N*4, szC=(VkDeviceSize)M*N*4;  // fp32
     Buf bA=c.alloc(szA,true), bB=c.alloc(szB,true), bC=c.alloc(szC,true);
-    std::vector<__fp16> hA((size_t)M*K), hB((size_t)K*N);
-    for (size_t i=0;i<hA.size();i++) hA[i]=(__fp16)(((i*131u+7u)%17u)*0.01f-0.08f);
-    for (size_t i=0;i<hB.size();i++) hB[i]=(__fp16)(((i*61u+13u)%19u)*0.01f-0.09f);
+    std::vector<float> hA((size_t)M*K), hB((size_t)K*N);
+    for (size_t i=0;i<hA.size();i++) hA[i]=(((i*131u+7u)%17u)*0.01f-0.08f);
+    for (size_t i=0;i<hB.size();i++) hB[i]=(((i*61u+13u)%19u)*0.01f-0.09f);
     c.upload(bA,hA.data(),szA); c.upload(bB,hB.data(),szB);
 
     Kernel k; k.create(c,spv.data(),spvLen,3,12);
@@ -186,12 +186,12 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmul(
     uint32_t pc[3]={(uint32_t)M,(uint32_t)N,(uint32_t)K};
     uint32_t gx=((uint32_t)N+127)/128, gy=((uint32_t)M+127)/128;
 
-    // прогрев + верификация
+    // прогрев + верификация (fp32)
     { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,pc,gx,gy,1); c.endCmd(cmd); }
-    { std::vector<__fp16> hC((size_t)M*N); c.download(bC,hC.data(),szC);
+    { std::vector<float> hC((size_t)M*N); c.download(bC,hC.data(),szC);
       double se=0,sr=0; for(int s=0;s<16;s++){ int r=(s*97+3)%M,col=(s*53+11)%N; float ref=0;
-        for(int kk=0;kk<K;kk++) ref+=(float)hA[(size_t)r*K+kk]*(float)hB[(size_t)kk*N+col];
-        se+=fabsf(ref-(float)hC[(size_t)r*N+col]); sr+=fabsf(ref);} double e=se/(sr+1e-6);
+        for(int kk=0;kk<K;kk++) ref+=hA[(size_t)r*K+kk]*hB[(size_t)kk*N+col];
+        se+=fabsf(ref-hC[(size_t)r*N+col]); sr+=fabsf(ref);} double e=se/(sr+1e-6);
       LOG("MATMUL %dx%dx%d corr=%.4f %s",M,N,K,e,e<0.02?"OK":"FAIL"); }
 
     double sec=timeDispatch(c,k,ds,pc,gx,gy,1,iters);
@@ -335,9 +335,11 @@ static Buf& W(const std::string& name){
     auto it=WC_.find(name); if(it!=WC_.end()) return it->second;
     std::string p=DIR_+"/"+name+".bin"; int64_t sz=fsize(p);
     if (sz<0){ LOG("WEIGHT MISSING %s",name.c_str()); }
-    std::vector<uint8_t> buf(sz>0?sz:2);
-    if (sz>0){ FILE* f=fopen(p.c_str(),"rb"); fread(buf.data(),1,sz,f); fclose(f); }
-    Buf b=C_->alloc(buf.size(),true); C_->upload(b,buf.data(),buf.size());
+    // файлы fp16 → конвертируем в fp32 на GPU (точность critical-path)
+    int64_t n=(sz>0?sz:2)/2; std::vector<__fp16> h(n);
+    if (sz>0){ FILE* f=fopen(p.c_str(),"rb"); fread(h.data(),2,n,f); fclose(f); }
+    std::vector<float> f32(n); for(int64_t i=0;i<n;i++) f32[i]=(float)h[i];
+    Buf b=C_->alloc((VkDeviceSize)n*4,true); C_->upload(b,f32.data(),(VkDeviceSize)n*4);
     WC_[name]=b; return WC_[name];
 }
 static bool has(const std::string& name){ return fsize(DIR_+"/"+name+".bin")>0; }
@@ -361,19 +363,26 @@ static void addbias_l(Buf& y,Buf& b,uint32_t n,uint32_t Cc){ AB2p p{n,Cc}; op(AB
 static void addv(Buf& a,Buf& b,Buf& y,uint32_t n){ N1p p{n}; op(ADD,{&a,&b,&y},&p,4,(n+255)/256,1,1); }
 static void matmul(Buf& a,Buf& b,Buf& y,uint32_t M,uint32_t N,uint32_t K){ MMp p{M,N,K}; op(MM,{&a,&b,&y},&p,12,(N+127)/128,(M+127)/128,1); }
 
+static int gDbg=0;
+static void stat(Buf& b, uint32_t n, const char* lbl){
+    if (gDbg>6) return;
+    std::vector<float> v(n); C_->download(b,v.data(),(VkDeviceSize)n*4);
+    float mx=0,s=0; int nan=0; for(uint32_t i=0;i<n;i++){ float x=v[i]; if(x!=x)nan++; if(fabsf(x)>mx)mx=fabsf(x); s+=x; }
+    LOG("STAT %s n=%u absmax=%.3f mean=%.4f nan=%d",lbl,n,mx,s/n,nan);
+}
 // ResNet-блок: x[Cin,H,W] + temb[1280] → out[Cout,H,W]
 static Buf resnet(const std::string& pf, Buf& x, Buf& temb, uint32_t Cin, uint32_t Cout, uint32_t H, uint32_t Wd){
     uint32_t HWi=H*Wd, Ni=Cin*HWi, No=Cout*HWi;
-    Buf h=mk((VkDeviceSize)Ni*2); groupnorm(x,W(pf+".norm1.weight"),W(pf+".norm1.bias"),h,Cin,HWi); silu(h,Ni);
-    Buf hc=mk((VkDeviceSize)No*2); conv(h,W(pf+".conv1.weight"),hc,Cin,Cout,H,Wd,3,1,1); addbias_c(hc,W(pf+".conv1.bias"),Cout,HWi);
+    Buf h=mk((VkDeviceSize)Ni*4); groupnorm(x,W(pf+".norm1.weight"),W(pf+".norm1.bias"),h,Cin,HWi); silu(h,Ni);
+    Buf hc=mk((VkDeviceSize)No*4); conv(h,W(pf+".conv1.weight"),hc,Cin,Cout,H,Wd,3,1,1); addbias_c(hc,W(pf+".conv1.bias"),Cout,HWi);
     // time emb
-    Buf ts=mk(1280*2); { N1p p{1280}; op(SILU,{&temb,&ts},&p,4,(1280+255)/256,1,1); }
-    Buf tp=mk((VkDeviceSize)Cout*2); matmul(ts,W(pf+".time_emb_proj.weight"),tp,1,Cout,1280); addbias_l(tp,W(pf+".time_emb_proj.bias"),Cout,Cout);
+    Buf ts=mk(1280*4); { N1p p{1280}; op(SILU,{&temb,&ts},&p,4,(1280+255)/256,1,1); }
+    Buf tp=mk((VkDeviceSize)Cout*4); matmul(ts,W(pf+".time_emb_proj.weight"),tp,1,Cout,1280); addbias_l(tp,W(pf+".time_emb_proj.bias"),Cout,Cout);
     { ABp p{Cout,HWi}; op(AB,{&hc,&tp},&p,8,(No+255)/256,1,1); }   // hc += tp broadcast
-    Buf h2=mk((VkDeviceSize)No*2); groupnorm(hc,W(pf+".norm2.weight"),W(pf+".norm2.bias"),h2,Cout,HWi); silu(h2,No);
-    Buf hc2=mk((VkDeviceSize)No*2); conv(h2,W(pf+".conv2.weight"),hc2,Cout,Cout,H,Wd,3,1,1); addbias_c(hc2,W(pf+".conv2.bias"),Cout,HWi);
-    Buf out=mk((VkDeviceSize)No*2);
-    if (Cin!=Cout){ Buf sx=mk((VkDeviceSize)No*2); conv(x,W(pf+".conv_shortcut.weight"),sx,Cin,Cout,H,Wd,1,0,1); addbias_c(sx,W(pf+".conv_shortcut.bias"),Cout,HWi); addv(sx,hc2,out,No); }
+    Buf h2=mk((VkDeviceSize)No*4); groupnorm(hc,W(pf+".norm2.weight"),W(pf+".norm2.bias"),h2,Cout,HWi); silu(h2,No);
+    Buf hc2=mk((VkDeviceSize)No*4); conv(h2,W(pf+".conv2.weight"),hc2,Cout,Cout,H,Wd,3,1,1); addbias_c(hc2,W(pf+".conv2.bias"),Cout,HWi);
+    Buf out=mk((VkDeviceSize)No*4);
+    if (Cin!=Cout){ Buf sx=mk((VkDeviceSize)No*4); conv(x,W(pf+".conv_shortcut.weight"),sx,Cin,Cout,H,Wd,1,0,1); addbias_c(sx,W(pf+".conv_shortcut.bias"),Cout,HWi); addv(sx,hc2,out,No); }
     else addv(x,hc2,out,No);
     return out;
 }
@@ -381,12 +390,12 @@ static Buf resnet(const std::string& pf, Buf& x, Buf& temb, uint32_t Cin, uint32
 // Transformer-блок (SpatialTransformer): x[C,H,W] + ctx[77,768] → out[C,H,W]
 static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uint32_t H, uint32_t Wd, uint32_t nh){
     uint32_t HW=H*Wd, N=Cc*HW, d=Cc/nh, ctxN=77, C2=Cc*4, PROJ=Cc*8;
-    Buf g1=mk((VkDeviceSize)N*2); groupnorm(x,W(pf+".norm.weight"),W(pf+".norm.bias"),g1,Cc,HW);
-    Buf p1=mk((VkDeviceSize)N*2); conv(g1,W(pf+".proj_in.weight"),p1,Cc,Cc,H,Wd,1,0,1); addbias_c(p1,W(pf+".proj_in.bias"),Cc,HW);
-    Buf t=mk((VkDeviceSize)N*2); { T2p p{Cc,HW}; op(T_CH,{&p1,&t},&p,8,(N+255)/256,1,1); }
+    Buf g1=mk((VkDeviceSize)N*4); groupnorm(x,W(pf+".norm.weight"),W(pf+".norm.bias"),g1,Cc,HW);
+    Buf p1=mk((VkDeviceSize)N*4); conv(g1,W(pf+".proj_in.weight"),p1,Cc,Cc,H,Wd,1,0,1); addbias_c(p1,W(pf+".proj_in.bias"),Cc,HW);
+    Buf t=mk((VkDeviceSize)N*4); { T2p p{Cc,HW}; op(T_CH,{&p1,&t},&p,8,(N+255)/256,1,1); }
     std::string b=pf+".transformer_blocks.0";
-    Buf h=mk((VkDeviceSize)N*2),q=mk((VkDeviceSize)N*2),k=mk((VkDeviceSize)N*2),v=mk((VkDeviceSize)N*2),a=mk((VkDeviceSize)N*2);
-    Buf qh=mk((VkDeviceSize)N*2),kh=mk((VkDeviceSize)N*2),vh=mk((VkDeviceSize)N*2),ah=mk((VkDeviceSize)N*2);
+    Buf h=mk((VkDeviceSize)N*4),q=mk((VkDeviceSize)N*4),k=mk((VkDeviceSize)N*4),v=mk((VkDeviceSize)N*4),a=mk((VkDeviceSize)N*4);
+    Buf qh=mk((VkDeviceSize)N*4),kh=mk((VkDeviceSize)N*4),vh=mk((VkDeviceSize)N*4),ah=mk((VkDeviceSize)N*4);
     auto split=[&](Buf& src,Buf& dst,uint32_t seq){ SHp p{seq,nh,d}; op(SPLIT,{&src,&dst},&p,12,(seq*nh*d+255)/256,1,1); };
     auto merge=[&](Buf& src,Buf& dst,uint32_t seq){ SHp p{seq,nh,d}; op(MERGE,{&src,&dst},&p,12,(seq*nh*d+255)/256,1,1); };
     // self-attn
@@ -394,59 +403,59 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
     matmul(h,W(b+".attn1.to_q.weight"),q,HW,Cc,Cc); matmul(h,W(b+".attn1.to_k.weight"),k,HW,Cc,Cc); matmul(h,W(b+".attn1.to_v.weight"),v,HW,Cc,Cc);
     split(q,qh,HW); split(k,kh,HW); split(v,vh,HW);
     { ATp p{HW,HW,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&kh,&vh,&ah},&p,20,(HW+63)/64,nh,1);}else{op(ATTN_BIG,{&qh,&kh,&vh,&ah},&p,20,(HW+15)/16,nh,1);} }
-    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*2); matmul(a,W(b+".attn1.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn1.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
+    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*4); matmul(a,W(b+".attn1.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn1.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
     // cross-attn
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm2.weight"),&W(b+".norm2.bias"),&h},&p,12,HW,1,1); }
     matmul(h,W(b+".attn2.to_q.weight"),q,HW,Cc,Cc);
-    Buf kc=mk((VkDeviceSize)ctxN*Cc*2),vc=mk((VkDeviceSize)ctxN*Cc*2),khc=mk((VkDeviceSize)ctxN*Cc*2),vhc=mk((VkDeviceSize)ctxN*Cc*2);
+    Buf kc=mk((VkDeviceSize)ctxN*Cc*4),vc=mk((VkDeviceSize)ctxN*Cc*4),khc=mk((VkDeviceSize)ctxN*Cc*4),vhc=mk((VkDeviceSize)ctxN*Cc*4);
     matmul(ctx,W(b+".attn2.to_k.weight"),kc,ctxN,Cc,768); matmul(ctx,W(b+".attn2.to_v.weight"),vc,ctxN,Cc,768);
     split(q,qh,HW); split(kc,khc,ctxN); split(vc,vhc,ctxN);
     { ATp p{HW,ctxN,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&khc,&vhc,&ah},&p,20,(HW+63)/64,nh,1);}else{op(ATTN_BIG,{&qh,&khc,&vhc,&ah},&p,20,(HW+15)/16,nh,1);} }
-    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*2); matmul(a,W(b+".attn2.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn2.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
+    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*4); matmul(a,W(b+".attn2.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn2.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
     // ff GEGLU
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm3.weight"),&W(b+".norm3.bias"),&h},&p,12,HW,1,1); }
-    Buf gg=mk((VkDeviceSize)HW*PROJ*2); matmul(h,W(b+".ff.net.0.proj.weight"),gg,HW,PROJ,Cc); addbias_l(gg,W(b+".ff.net.0.proj.bias"),HW*PROJ,PROJ);
-    Buf gf=mk((VkDeviceSize)HW*C2*2); { GGp p{HW,C2}; op(GEGLU,{&gg,&gf},&p,8,(HW*C2+255)/256,1,1); }
-    Buf ff=mk((VkDeviceSize)N*2); matmul(gf,W(b+".ff.net.2.weight"),ff,HW,Cc,C2); addbias_l(ff,W(b+".ff.net.2.bias"),N,Cc); addv(t,ff,t,N);
+    Buf gg=mk((VkDeviceSize)HW*PROJ*4); matmul(h,W(b+".ff.net.0.proj.weight"),gg,HW,PROJ,Cc); addbias_l(gg,W(b+".ff.net.0.proj.bias"),HW*PROJ,PROJ);
+    Buf gf=mk((VkDeviceSize)HW*C2*4); { GGp p{HW,C2}; op(GEGLU,{&gg,&gf},&p,8,(HW*C2+255)/256,1,1); }
+    Buf ff=mk((VkDeviceSize)N*4); matmul(gf,W(b+".ff.net.2.weight"),ff,HW,Cc,C2); addbias_l(ff,W(b+".ff.net.2.bias"),N,Cc); addv(t,ff,t,N);
     // proj_out + residual
-    Buf tt=mk((VkDeviceSize)N*2); { T2p p{HW,Cc}; op(T_HC,{&t,&tt},&p,8,(N+255)/256,1,1); }
-    Buf po=mk((VkDeviceSize)N*2); conv(tt,W(pf+".proj_out.weight"),po,Cc,Cc,H,Wd,1,0,1); addbias_c(po,W(pf+".proj_out.bias"),Cc,HW);
-    Buf out=mk((VkDeviceSize)N*2); addv(x,po,out,N);
+    Buf tt=mk((VkDeviceSize)N*4); { T2p p{HW,Cc}; op(T_HC,{&t,&tt},&p,8,(N+255)/256,1,1); }
+    Buf po=mk((VkDeviceSize)N*4); conv(tt,W(pf+".proj_out.weight"),po,Cc,Cc,H,Wd,1,0,1); addbias_c(po,W(pf+".proj_out.bias"),Cc,HW);
+    Buf out=mk((VkDeviceSize)N*4); addv(x,po,out,N);
     return out;
 }
 
 // concat по каналам: [Cp,HW] ++ [Cs,HW] → [(Cp+Cs),HW] (смежная память)
 static Buf concat(Buf& prev, uint32_t Cp, Buf& skip, uint32_t Cs, uint32_t HW){
-    Buf out=mk((VkDeviceSize)(Cp+Cs)*HW*2);
+    Buf out=mk((VkDeviceSize)(Cp+Cs)*HW*4);
     VkCommandBuffer cmd=C_->beginCmd();
-    VkBufferCopy c1{0,0,(VkDeviceSize)Cp*HW*2}; vkCmdCopyBuffer(cmd,prev.buf,out.buf,1,&c1);
-    VkBufferCopy c2{0,(VkDeviceSize)Cp*HW*2,(VkDeviceSize)Cs*HW*2}; vkCmdCopyBuffer(cmd,skip.buf,out.buf,1,&c2);
+    VkBufferCopy c1{0,0,(VkDeviceSize)Cp*HW*4}; vkCmdCopyBuffer(cmd,prev.buf,out.buf,1,&c1);
+    VkBufferCopy c2{0,(VkDeviceSize)Cp*HW*4,(VkDeviceSize)Cs*HW*4}; vkCmdCopyBuffer(cmd,skip.buf,out.buf,1,&c2);
     C_->endCmd(cmd); return out;
 }
 static Buf downsample(const std::string& pf, Buf& x, uint32_t Cc, uint32_t H, uint32_t Wd){
-    uint32_t Ho=H/2, Wo=Wd/2; Buf y=mk((VkDeviceSize)Cc*Ho*Wo*2);
+    uint32_t Ho=H/2, Wo=Wd/2; Buf y=mk((VkDeviceSize)Cc*Ho*Wo*4);
     conv(x,W(pf+".conv.weight"),y,Cc,Cc,H,Wd,3,1,2); addbias_c(y,W(pf+".conv.bias"),Cc,Ho*Wo); return y;
 }
 static Buf upsample(const std::string& pf, Buf& x, uint32_t Cc, uint32_t H, uint32_t Wd){
-    uint32_t Ho=H*2, Wo=Wd*2; Buf u=mk((VkDeviceSize)Cc*Ho*Wo*2);
+    uint32_t Ho=H*2, Wo=Wd*2; Buf u=mk((VkDeviceSize)Cc*Ho*Wo*4);  // 2× upsample (геометрия)
     { struct{uint32_t C,H,W;}p{Cc,H,Wd}; op(UP,{&x,&u},&p,12,(Cc*Ho*Wo+255)/256,1,1); }
-    Buf y=mk((VkDeviceSize)Cc*Ho*Wo*2); conv(u,W(pf+".conv.weight"),y,Cc,Cc,Ho,Wo,3,1,1); addbias_c(y,W(pf+".conv.bias"),Cc,Ho*Wo); return y;
+    Buf y=mk((VkDeviceSize)Cc*Ho*Wo*4); conv(u,W(pf+".conv.weight"),y,Cc,Cc,Ho,Wo,3,1,1); addbias_c(y,W(pf+".conv.bias"),Cc,Ho*Wo); return y;
 }
 static double corrCheck(Buf& got, const std::string& refName, uint32_t n){
     std::string p=DIR_+"/"+refName+".bin"; int64_t sz=fsize(p); if(sz<0) return -1;
     std::vector<__fp16> ref(sz/2); FILE* f=fopen(p.c_str(),"rb"); fread(ref.data(),1,sz,f); fclose(f);
-    std::vector<__fp16> hy(n); C_->download(got,hy.data(),(VkDeviceSize)n*2);
-    double se=0,sr=0; for(uint32_t i=0;i<n;i+=17){ se+=fabsf((float)ref[i]-(float)hy[i]); sr+=fabsf((float)ref[i]); }
+    std::vector<float> hy(n); C_->download(got,hy.data(),(VkDeviceSize)n*4);
+    double se=0,sr=0; for(uint32_t i=0;i<n;i+=17){ se+=fabsf((float)ref[i]-hy[i]); sr+=fabsf((float)ref[i]); }
     return se/(sr+1e-6);
 }
 // Полный UNet forward: lat[4,64,64], tembProj[320], ctx[77,768] → noise[4,64,64].
 // Использует persistent веса (WC_) и scratch (SCRATCH_).
 static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
     // time embedding MLP
-    Buf t1=mk(1280*2); matmul(tembp,W("time_embedding.linear_1.weight"),t1,1,1280,320); addbias_l(t1,W("time_embedding.linear_1.bias"),1280,1280); silu(t1,1280);
-    Buf temb=mk(1280*2); matmul(t1,W("time_embedding.linear_2.weight"),temb,1,1280,1280); addbias_l(temb,W("time_embedding.linear_2.bias"),1280,1280);
+    Buf t1=mk(1280*4); matmul(tembp,W("time_embedding.linear_1.weight"),t1,1,1280,320); addbias_l(t1,W("time_embedding.linear_1.bias"),1280,1280); silu(t1,1280);
+    Buf temb=mk(1280*4); matmul(t1,W("time_embedding.linear_2.weight"),temb,1,1280,1280); addbias_l(temb,W("time_embedding.linear_2.bias"),1280,1280);
     // conv_in: 4→320
-    Buf x=mk((VkDeviceSize)320*64*64*2); conv(lat,W("conv_in.weight"),x,4,320,64,64,3,1,1); addbias_c(x,W("conv_in.bias"),320,64*64);
+    Buf x=mk((VkDeviceSize)320*64*64*4); conv(lat,W("conv_in.weight"),x,4,320,64,64,3,1,1); addbias_c(x,W("conv_in.bias"),320,64*64);
     std::vector<Buf> skips; skips.push_back(x);
     uint32_t bo[4]={320,640,1280,1280};
     // ---- DOWN ----
@@ -469,7 +478,7 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
     x=resnet("mid_block.resnets.1",x,temb,1280,1280,H,H);
     LOG("GRAPH mid done");
     // ---- UP ---- up[i]: 3 resnet (cat skip), attn (кроме up0), upsample (кроме up3)
-    uint32_t upout[4]={1280,640,320,320};
+    uint32_t upout[4]={1280,1280,640,320};
     for (int i=0;i<4;i++){
         uint32_t Cout=upout[i]; bool attn=(i>0); bool up=(i<3);
         char pre[48];
@@ -477,7 +486,7 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
             Buf skip=skips.back(); skips.pop_back();
             uint32_t Cs=bo[3-i]; // каналы skip соответствуют уровню
             // точные каналы skip берём из размера буфера
-            uint32_t Cskip=(uint32_t)(skip.size/2/((VkDeviceSize)H*H));
+            uint32_t Cskip=(uint32_t)(skip.size/4/((VkDeviceSize)H*H));  // fp32: 4 байта/элемент
             uint32_t Cin=Cprev+Cskip;
             Buf cc=concat(x,Cprev,skip,Cskip,H*H);
             snprintf(pre,48,"up_blocks.%d.resnets.%d",i,r);
@@ -488,8 +497,8 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
     }
     LOG("GRAPH up done H=%d",H);
     // ---- OUT ---- groupnorm+silu+conv_out(320→4)
-    Buf gno=mk((VkDeviceSize)320*H*H*2); groupnorm(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H); silu(gno,320*H*H);
-    Buf y=mk((VkDeviceSize)4*H*H*2); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,H*H);
+    Buf gno=mk((VkDeviceSize)320*H*H*4); groupnorm(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H); silu(gno,320*H*H);
+    Buf y=mk((VkDeviceSize)4*H*H*4); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,H*H);
     return y;
 }
 static VkCtx gCtx; static bool gInit=false;
@@ -511,16 +520,32 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetInit(
     gInit=true; LOG("UNET init OK"); return 0;
 }
 
+// self-test: эталонный вход IN_* из файлов → граф → corr vs OUT_y (диагностика fp32)
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_unetSelfTest(JNIEnv*, jobject) {
+    using namespace unet; if(!gInit) return -2;
+    auto loadF=[&](const std::string& nm, int n){ Buf b=mk((VkDeviceSize)n*4);
+        std::string p=DIR_+"/"+nm+".bin"; FILE* f=fopen(p.c_str(),"rb"); std::vector<__fp16> h(n);
+        if(f){ fread(h.data(),2,n,f); fclose(f); } std::vector<float> v(n); for(int i=0;i<n;i++) v[i]=(float)h[i];
+        gCtx.upload(b,v.data(),(VkDeviceSize)n*4); return b; };
+    Buf lat=loadF("IN_lat",4*64*64), ctx=loadF("IN_ctx",77*768), tp=loadF("IN_temb_proj",320);
+    Buf noise=runGraph(lat,tp,ctx);
+    double e=corrCheck(noise,"OUT_y",4*64*64);
+    LOG("UNET SELFTEST fp32 corr=%.4f %s",e,e<0.1?"OK":"FAIL");
+    for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();
+    return e;
+}
+
 // forward: latFp16[4*64*64*2], tembFp16[320*2], ctxFp16[77*768*2] → noiseFp16[4*64*64*2]
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_example_generet_1image_1ai_sd_VulkanBench_unetForward(
         JNIEnv* env, jobject, jbyteArray latB, jbyteArray tembB, jbyteArray ctxB) {
     using namespace unet; if(!gInit) return nullptr;
-    auto up=[&](jbyteArray a, uint32_t n){ Buf b=mk((VkDeviceSize)n*2); jsize l=env->GetArrayLength(a);
+    auto up=[&](jbyteArray a, uint32_t n){ Buf b=mk((VkDeviceSize)n*4); jsize l=env->GetArrayLength(a);
         std::vector<uint8_t> v(l); env->GetByteArrayRegion(a,0,l,(jbyte*)v.data()); gCtx.upload(b,v.data(),v.size()); return b; };
     Buf lat=up(latB,4*64*64), temb=up(tembB,320), ctx=up(ctxB,77*768);
     Buf noise=runGraph(lat,temb,ctx);
-    std::vector<uint8_t> out((size_t)4*64*64*2); gCtx.download(noise,out.data(),out.size());
+    std::vector<uint8_t> out((size_t)4*64*64*4); gCtx.download(noise,out.data(),out.size());
     jbyteArray res=env->NewByteArray((jsize)out.size()); env->SetByteArrayRegion(res,0,(jsize)out.size(),(jbyte*)out.data());
     for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();   // освобождаем временные, веса остаются
     return res;
