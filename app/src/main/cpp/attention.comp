@@ -1,40 +1,57 @@
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-// Flash-attention (online softmax), multi-head. Layout: Q/K/V/O [H, seq, d].
-// 1 поток = (head h, строка запроса i). Не материализует scores (память O(d), не O(seq²)).
-#define MAXD 160
-layout(local_size_x = 64) in;
+// Flash-attention v2 с тайлингом: workgroup из 64 потоков обрабатывает 64 query-строки
+// одной головы. K/V грузятся блоками по 64 в shared (переиспользование всеми потоками).
+// Layout Q/K/V/O [H, seq, d]. d <= 128 (для shared). seq self-attn d=40 → влезает.
+#define BT 64
+#define MAXD 128
+layout(local_size_x = BT) in;
 layout(set=0,binding=0) readonly buffer BQ { float16_t Q[]; };
 layout(set=0,binding=1) readonly buffer BK { float16_t K[]; };
 layout(set=0,binding=2) readonly buffer BV { float16_t V[]; };
 layout(set=0,binding=3) writeonly buffer BO { float16_t O[]; };
 layout(push_constant) uniform P { uint seqQ, seqK, d, H; float scale; } p;
 
+shared float16_t Ks[BT][MAXD];
+shared float16_t Vs[BT][MAXD];
+
 void main() {
-    uint i = gl_GlobalInvocationID.x;   // строка запроса
-    uint h = gl_GlobalInvocationID.y;   // голова
-    if (i >= p.seqQ || h >= p.H) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint i = gl_WorkGroupID.x * BT + tid;   // строка запроса
+    uint h = gl_WorkGroupID.y;              // голова
+    bool inrange = (i < p.seqQ) && (h < p.H);
+
+    float q[MAXD];
     uint qBase = (h*p.seqQ + i)*p.d;
-    uint hkBase = h*p.seqK*p.d;
+    if (inrange) for (uint k=0u;k<p.d;k++) q[k]=float(Q[qBase+k]);
 
     float acc[MAXD];
     for (uint k=0u;k<p.d;k++) acc[k]=0.0;
-    float m = -3.0e38, l = 0.0;
+    float m=-3.0e38, l=0.0;
+    uint hkBase = h*p.seqK*p.d;
 
-    for (uint j=0u;j<p.seqK;j++) {
-        uint kBase = hkBase + j*p.d;
-        float s = 0.0;
-        for (uint k=0u;k<p.d;k++) s += float(Q[qBase+k])*float(K[kBase+k]);
-        s *= p.scale;
-        float mnew = max(m, s);
-        float corr = exp(m - mnew);
-        float pj = exp(s - mnew);
-        l = l*corr + pj;
-        for (uint k=0u;k<p.d;k++) acc[k] = acc[k]*corr + pj*float(V[kBase+k]);
-        m = mnew;
+    // цикл по блокам ключей
+    for (uint kb=0u; kb<p.seqK; kb+=BT) {
+        // кооперативная загрузка блока K,V в shared (каждый поток грузит свою строку)
+        uint jg = kb + tid;
+        if (jg < p.seqK) for (uint k=0u;k<p.d;k++){ Ks[tid][k]=K[hkBase+jg*p.d+k]; Vs[tid][k]=V[hkBase+jg*p.d+k]; }
+        barrier();
+        if (inrange) {
+            uint cnt = min(BT, p.seqK-kb);
+            for (uint jj=0u; jj<cnt; jj++) {
+                float s=0.0; for (uint k=0u;k<p.d;k++) s += q[k]*float(Ks[jj][k]);
+                s *= p.scale;
+                float mnew=max(m,s); float corr=exp(m-mnew); float pj=exp(s-mnew);
+                l = l*corr + pj;
+                for (uint k=0u;k<p.d;k++) acc[k]=acc[k]*corr + pj*float(Vs[jj][k]);
+                m=mnew;
+            }
+        }
+        barrier();
     }
-    uint oBase = (h*p.seqQ + i)*p.d;
-    float invl = 1.0/l;
-    for (uint k=0u;k<p.d;k++) O[oBase+k] = float16_t(acc[k]*invl);
+    if (inrange) {
+        uint oBase=(h*p.seqQ+i)*p.d; float invl=1.0/l;
+        for (uint k=0u;k<p.d;k++) O[oBase+k]=float16_t(acc[k]*invl);
+    }
 }
