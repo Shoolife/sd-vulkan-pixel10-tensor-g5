@@ -201,6 +201,68 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmul(
     return g;
 }
 
+// ====================== JNI: CONV через im2col + GEMM ======================
+// Принимает 2 SPIR-V: im2col и matmul. conv → Col[K,Ncol] → Y=W×Col.
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_benchConvGemm(
+        JNIEnv* env, jobject, jbyteArray im2colSpv, jbyteArray matmulSpv,
+        jint Cin, jint Cout, jint H, jint W, jint KH, jint KW, jint iters) {
+    VkCtx c; if(!c.init()) return -1;
+    auto getSpv=[&](jbyteArray a){ jsize l=env->GetArrayLength(a); std::vector<uint8_t> v(l);
+        env->GetByteArrayRegion(a,0,l,(jbyte*)v.data()); return v; };
+    auto icSpv=getSpv(im2colSpv); auto mmSpv=getSpv(matmulSpv);
+    int pad=KH/2;
+    uint32_t Ncol=(uint32_t)H*W, Kcol=(uint32_t)Cin*KH*KW, Mc=(uint32_t)Cout;
+
+    VkDeviceSize szX=(VkDeviceSize)Cin*H*W*2, szW=(VkDeviceSize)Cout*Kcol*2;
+    VkDeviceSize szCol=(VkDeviceSize)Kcol*Ncol*2, szY=(VkDeviceSize)Cout*Ncol*2;
+    Buf bX=c.alloc(szX,true), bW=c.alloc(szW,true), bCol=c.alloc(szCol,true), bY=c.alloc(szY,true);
+    std::vector<__fp16> hX((size_t)Cin*H*W), hW((size_t)Cout*Kcol);
+    for (size_t i=0;i<hX.size();i++) hX[i]=(__fp16)(((i*131u+7u)%17u)*0.02f-0.16f);
+    for (size_t i=0;i<hW.size();i++) hW[i]=(__fp16)(((i*61u+13u)%19u)*0.02f-0.18f);
+    c.upload(bX,hX.data(),szX); c.upload(bW,hW.data(),szW);
+
+    Kernel ic; ic.create(c,icSpv.data(),icSpv.size(),2,32);
+    VkDescriptorSet icDs=ic.makeSet(c,{&bX,&bCol});
+    uint32_t icPc[8]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,(uint32_t)KH,(uint32_t)KW,(uint32_t)pad,Ncol,Kcol};
+    uint32_t icG=(Kcol*Ncol+255)/256;
+
+    Kernel mm; mm.create(c,mmSpv.data(),mmSpv.size(),3,12);
+    VkDescriptorSet mmDs=mm.makeSet(c,{&bW,&bCol,&bY});  // A=W[M,K], B=Col[K,N], C=Y[M,N]
+    uint32_t mmPc[3]={Mc,Ncol,Kcol};
+    uint32_t gx=(Ncol+127)/128, gy=(Mc+127)/128;
+
+    // один проход conv = im2col → matmul (с барьером между)
+    auto runConv=[&](VkCommandBuffer cmd){
+        ic.record(cmd,icDs,icPc,icG,1,1);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+        mm.record(cmd,mmDs,mmPc,gx,gy,1);
+    };
+    auto one=[&](){ VkCommandBuffer cmd=c.beginCmd(); runConv(cmd); c.endCmd(cmd); };
+    one(); // прогрев + для верификации
+    // верификация Y vs CPU
+    { std::vector<__fp16> hY((size_t)Cout*Ncol); c.download(bY,hY.data(),szY);
+      double se=0,sr=0;
+      for (int s=0;s<16;s++){ int co=(s*7+1)%Cout, oy=(s*13+2)%H, ox=(s*5+3)%W; float ref=0;
+        for (int ci=0;ci<Cin;ci++) for(int ky=0;ky<KH;ky++) for(int kx=0;kx<KW;kx++){
+            int iy=oy+ky-pad, ix=ox+kx-pad; if(iy<0||iy>=H||ix<0||ix>=W) continue;
+            ref += (float)hX[((size_t)ci*H+iy)*W+ix]*(float)hW[(((size_t)co*Cin+ci)*KH+ky)*KW+kx]; }
+        se+=fabsf(ref-(float)hY[(size_t)co*Ncol+(size_t)oy*W+ox]); sr+=fabsf(ref); }
+      double e=se/(sr+1e-6);
+      LOG("CONVGEMM Cin%d Cout%d %dx%d k%d corr=%.4f %s",Cin,Cout,H,W,KH,e,e<0.03?"OK":"FAIL"); }
+
+    auto t0=std::chrono::high_resolution_clock::now();
+    for (int i=0;i<iters;i++) one();
+    auto t1=std::chrono::high_resolution_clock::now();
+    double sec=std::chrono::duration<double>(t1-t0).count()/iters;
+    double flops=2.0*(double)Cout*Cin*H*W*KH*KW;
+    LOG("convGEMM Cin%d Cout%d %dx%d k%d: %.3f ms, %.1f GFLOPS",Cin,Cout,H,W,KH,sec*1000,flops/sec/1e9);
+    ic.destroy(c); mm.destroy(c); c.free(bX);c.free(bW);c.free(bCol);c.free(bY); c.destroy();
+    return flops/sec/1e9;
+}
+
 // ====================== JNI: CONV2D ======================
 // X[Cin,H,W] * W[Cout,Cin,KH,KW] -> Y[Cout,H,W], same padding, stride 1, N=1. fp16 storage, fp32 acc.
 extern "C" JNIEXPORT jdouble JNICALL
