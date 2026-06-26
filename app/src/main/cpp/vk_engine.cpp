@@ -324,7 +324,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
 #include <cerrno>
 namespace unet {
 // шейдеры по индексу (порядок задаёт Kotlin)
-enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, NSH };
+enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, NSH };
 static VkCtx* C_; static std::vector<std::vector<uint8_t>>* SH_; static std::string DIR_;
 static std::map<std::string,Buf> WC_;  // кэш весов
 
@@ -392,7 +392,7 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm1.weight"),&W(b+".norm1.bias"),&h},&p,12,HW,1,1); }
     matmul(h,W(b+".attn1.to_q.weight"),q,HW,Cc,Cc); matmul(h,W(b+".attn1.to_k.weight"),k,HW,Cc,Cc); matmul(h,W(b+".attn1.to_v.weight"),v,HW,Cc,Cc);
     split(q,qh,HW); split(k,kh,HW); split(v,vh,HW);
-    { ATp p{HW,HW,d,nh,1.0f/sqrtf((float)d)}; op(ATTN,{&qh,&kh,&vh,&ah},&p,20,(HW+63)/64,nh,1); }
+    { ATp p{HW,HW,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&kh,&vh,&ah},&p,20,(HW+63)/64,nh,1);}else{op(ATTN_BIG,{&qh,&kh,&vh,&ah},&p,20,(HW+15)/16,nh,1);} }
     merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*2); matmul(a,W(b+".attn1.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn1.to_out.0.bias"),N,Cc); addv(t,ao,t,N); C_->free(ao); }
     // cross-attn
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm2.weight"),&W(b+".norm2.bias"),&h},&p,12,HW,1,1); }
@@ -400,7 +400,7 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
     Buf kc=mk((VkDeviceSize)ctxN*Cc*2),vc=mk((VkDeviceSize)ctxN*Cc*2),khc=mk((VkDeviceSize)ctxN*Cc*2),vhc=mk((VkDeviceSize)ctxN*Cc*2);
     matmul(ctx,W(b+".attn2.to_k.weight"),kc,ctxN,Cc,768); matmul(ctx,W(b+".attn2.to_v.weight"),vc,ctxN,Cc,768);
     split(q,qh,HW); split(kc,khc,ctxN); split(vc,vhc,ctxN);
-    { ATp p{HW,ctxN,d,nh,1.0f/sqrtf((float)d)}; op(ATTN,{&qh,&khc,&vhc,&ah},&p,20,(HW+63)/64,nh,1); }
+    { ATp p{HW,ctxN,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&khc,&vhc,&ah},&p,20,(HW+63)/64,nh,1);}else{op(ATTN_BIG,{&qh,&khc,&vhc,&ah},&p,20,(HW+15)/16,nh,1);} }
     merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*2); matmul(a,W(b+".attn2.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn2.to_out.0.bias"),N,Cc); addv(t,ao,t,N); C_->free(ao); }
     // ff GEGLU
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm3.weight"),&W(b+".norm3.bias"),&h},&p,12,HW,1,1); }
@@ -414,6 +414,23 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
     return out;
 }
 
+// concat по каналам: [Cp,HW] ++ [Cs,HW] → [(Cp+Cs),HW] (смежная память)
+static Buf concat(Buf& prev, uint32_t Cp, Buf& skip, uint32_t Cs, uint32_t HW){
+    Buf out=mk((VkDeviceSize)(Cp+Cs)*HW*2);
+    VkCommandBuffer cmd=C_->beginCmd();
+    VkBufferCopy c1{0,0,(VkDeviceSize)Cp*HW*2}; vkCmdCopyBuffer(cmd,prev.buf,out.buf,1,&c1);
+    VkBufferCopy c2{0,(VkDeviceSize)Cp*HW*2,(VkDeviceSize)Cs*HW*2}; vkCmdCopyBuffer(cmd,skip.buf,out.buf,1,&c2);
+    C_->endCmd(cmd); return out;
+}
+static Buf downsample(const std::string& pf, Buf& x, uint32_t Cc, uint32_t H, uint32_t Wd){
+    uint32_t Ho=H/2, Wo=Wd/2; Buf y=mk((VkDeviceSize)Cc*Ho*Wo*2);
+    conv(x,W(pf+".conv.weight"),y,Cc,Cc,H,Wd,3,1,2); addbias_c(y,W(pf+".conv.bias"),Cc,Ho*Wo); return y;
+}
+static Buf upsample(const std::string& pf, Buf& x, uint32_t Cc, uint32_t H, uint32_t Wd){
+    uint32_t Ho=H*2, Wo=Wd*2; Buf u=mk((VkDeviceSize)Cc*Ho*Wo*2);
+    { struct{uint32_t C,H,W;}p{Cc,H,Wd}; op(UP,{&x,&u},&p,12,(Cc*Ho*Wo+255)/256,1,1); }
+    Buf y=mk((VkDeviceSize)Cc*Ho*Wo*2); conv(u,W(pf+".conv.weight"),y,Cc,Cc,Ho,Wo,3,1,1); addbias_c(y,W(pf+".conv.bias"),Cc,Ho*Wo); return y;
+}
 static double corrCheck(Buf& got, const std::string& refName, uint32_t n){
     std::string p=DIR_+"/"+refName+".bin"; int64_t sz=fsize(p); if(sz<0) return -1;
     std::vector<__fp16> ref(sz/2); FILE* f=fopen(p.c_str(),"rb"); fread(ref.data(),1,sz,f); fclose(f);
@@ -448,19 +465,52 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runUNetDown0(
     LOG("UNET temb corr=%.4f",corrCheck(temb,"INT_temb",1280));
     // conv_in: 4→320
     Buf x=mk((VkDeviceSize)320*64*64*2); conv(lat,W("conv_in.weight"),x,4,320,64,64,3,1,1); addbias_c(x,W("conv_in.bias"),320,64*64);
-    double e_ci=corrCheck(x,"INT_conv_in",320*64*64); LOG("UNET conv_in corr=%.4f",e_ci);
-    // down[0]: 2×(resnet 320→320 + transformer 320), downsample 320→320 stride2
-    Buf r0=resnet("down_blocks.0.resnets.0",x,temb,320,320,64,64);
-    LOG("UNET d0.r0 corr=%.4f",corrCheck(r0,"INT_d0_r0",320*64*64));
-    Buf a0=transformer("down_blocks.0.attentions.0",r0,ctx,320,64,64,8);
-    LOG("UNET d0.a0 corr=%.4f",corrCheck(a0,"INT_d0_a0",320*64*64));
-    Buf r1=resnet("down_blocks.0.resnets.1",a0,temb,320,320,64,64);
-    LOG("UNET d0.r1 corr=%.4f",corrCheck(r1,"INT_d0_r1",320*64*64));
-    Buf a1=transformer("down_blocks.0.attentions.1",r1,ctx,320,64,64,8);
-    LOG("UNET d0.a1 corr=%.4f",corrCheck(a1,"INT_d0_a1",320*64*64));
-    Buf ds=mk((VkDeviceSize)320*32*32*2); conv(a1,W("down_blocks.0.downsamplers.0.conv.weight"),ds,320,320,64,64,3,1,2); addbias_c(ds,W("down_blocks.0.downsamplers.0.conv.bias"),320,32*32);
-    double e_d0=corrCheck(ds,"INT_down0",320*32*32); LOG("UNET down0 corr=%.4f %s",e_d0,e_d0<0.08?"OK":"FAIL");
-    c.destroy(); return e_d0;
+    std::vector<Buf> skips; skips.push_back(x);
+    uint32_t bo[4]={320,640,1280,1280};
+    auto P=[&](const char*f,int i,const char*s){ char buf[64]; snprintf(buf,64,f,i,s); return std::string(buf); };
+    // ---- DOWN ----
+    uint32_t Cprev=320, H=64;
+    for (int i=0;i<4;i++){
+        uint32_t Cout=bo[i]; bool attn=(i<3);
+        char pre[48];
+        for (int r=0;r<2;r++){
+            snprintf(pre,48,"down_blocks.%d.resnets.%d",i,r);
+            Buf nx=resnet(pre,x,temb,(r==0)?Cprev:Cout,Cout,H,H); x=nx; Cprev=Cout;
+            if (attn){ snprintf(pre,48,"down_blocks.%d.attentions.%d",i,r); x=transformer(pre,x,ctx,Cout,H,H,8); }
+            skips.push_back(x);
+        }
+        if (i<3){ snprintf(pre,48,"down_blocks.%d.downsamplers.0",i); x=downsample(pre,x,Cout,H,H); H/=2; skips.push_back(x); }
+    }
+    LOG("UNET down done H=%d C=%d skips=%zu",H,Cprev,skips.size());
+    // ---- MID ---- (1280, 8×8): resnet+transformer+resnet
+    x=resnet("mid_block.resnets.0",x,temb,1280,1280,H,H);
+    x=transformer("mid_block.attentions.0",x,ctx,1280,H,H,8);
+    x=resnet("mid_block.resnets.1",x,temb,1280,1280,H,H);
+    double e_mid=corrCheck(x,"INT_mid",1280*H*H); LOG("UNET mid corr=%.4f",e_mid);
+    // ---- UP ---- up[i]: 3 resnet (cat skip), attn (кроме up0), upsample (кроме up3)
+    uint32_t upout[4]={1280,640,320,320};
+    for (int i=0;i<4;i++){
+        uint32_t Cout=upout[i]; bool attn=(i>0); bool up=(i<3);
+        char pre[48];
+        for (int r=0;r<3;r++){
+            Buf skip=skips.back(); skips.pop_back();
+            uint32_t Cs=bo[3-i]; // каналы skip соответствуют уровню
+            // точные каналы skip берём из размера буфера
+            uint32_t Cskip=(uint32_t)(skip.size/2/((VkDeviceSize)H*H));
+            uint32_t Cin=Cprev+Cskip;
+            Buf cc=concat(x,Cprev,skip,Cskip,H*H);
+            snprintf(pre,48,"up_blocks.%d.resnets.%d",i,r);
+            x=resnet(pre,cc,temb,Cin,Cout,H,H); Cprev=Cout; C_->free(cc);
+            if (attn){ snprintf(pre,48,"up_blocks.%d.attentions.%d",i,r); x=transformer(pre,x,ctx,Cout,H,H,8); }
+        }
+        if (up){ snprintf(pre,48,"up_blocks.%d.upsamplers.0",i); x=upsample(pre,x,Cout,H,H); H*=2; }
+    }
+    LOG("UNET up done H=%d C=%d",H,Cprev);
+    // ---- OUT ---- groupnorm+silu+conv_out(320→4)
+    Buf gno=mk((VkDeviceSize)320*H*H*2); groupnorm(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H); silu(gno,320*H*H);
+    Buf y=mk((VkDeviceSize)4*H*H*2); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,H*H);
+    double e=corrCheck(y,"OUT_y",4*64*64); LOG("UNET FULL corr=%.4f %s",e,e<0.15?"OK":"FAIL");
+    c.destroy(); return e;
 }
 
 // ====================== JNI: TRANSFORMER BLOCK ======================

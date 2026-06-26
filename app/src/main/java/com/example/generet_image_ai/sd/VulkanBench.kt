@@ -22,10 +22,10 @@ object VulkanBench {
         // порядок = enum S в C++: GN,SILU,CONV,MM,AB,AB2,ADD,LN,SPLIT,ATTN,MERGE,GEGLU,T_CH,T_HC,UP
         val shaders = arrayOf(sh("groupnorm"), sh("silu"), sh("conv2d"), sh("matmul"), sh("addbias"),
             sh("addbias2"), sh("add"), sh("layernorm"), sh("split_heads"), sh("attention"),
-            sh("merge_heads"), sh("geglu"), sh("t_chw2hwc"), sh("t_hwc2chw"), sh("upsample"))
+            sh("merge_heads"), sh("geglu"), sh("t_chw2hwc"), sh("t_hwc2chw"), sh("upsample"), sh("attention_big"))
         val dir = java.io.File(ctx.getExternalFilesDir(null), "unet_w").absolutePath
         val err = runUNetDown0(shaders, dir)
-        return "UNet down[0] vs PyTorch: relErr=${"%.4f".format(err)} ${if (err in 0.0..0.08) "OK" else "FAIL"}"
+        return "Полный UNet vs PyTorch: relErr=${"%.4f".format(err)} ${if (err in 0.0..0.15) "OK" else "FAIL"}"
     }
 
     fun transformerCheck(ctx: Context): String {
