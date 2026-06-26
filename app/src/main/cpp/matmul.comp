@@ -1,7 +1,8 @@
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-// fp16 GEMM: workgroup 16×16, каждый поток 8 строк × 2 f16vec4 (8×8=64 выхода). Тайл 128×128.
+// fp16 storage, FP32 accumulate (как tensor cores) — точность + скорость.
+// workgroup 16×16, поток считает 8 строк × 2 vec4 (8×8=64 выхода). Тайл 128×128.
 #define BM 128
 #define BN 128
 #define BK 16
@@ -23,8 +24,8 @@ void main() {
     uint tr  = (tid / 16u) * TM;
     uint tcv = (tid % 16u) * 2u;
 
-    f16vec4 acc0[TM]; f16vec4 acc1[TM];
-    for (int i=0;i<TM;i++){ acc0[i]=f16vec4(0.0); acc1[i]=f16vec4(0.0); }
+    vec4 acc0[TM]; vec4 acc1[TM];          // FP32 аккумуляторы
+    for (int i=0;i<TM;i++){ acc0[i]=vec4(0.0); acc1[i]=vec4(0.0); }
 
     uint tiles = (p.K + BK - 1u) / BK;
     for (uint t = 0u; t < tiles; t++) {
@@ -40,13 +41,13 @@ void main() {
         }
         barrier();
         for (uint k = 0u; k < BK; k++) {
-            f16vec4 b0 = Bs[k][tcv]; f16vec4 b1 = Bs[k][tcv+1u];
-            for (int i=0;i<TM;i++){ float16_t a = As[k][tr+i]; acc0[i]+=a*b0; acc1[i]+=a*b1; }
+            vec4 b0 = vec4(Bs[k][tcv]); vec4 b1 = vec4(Bs[k][tcv+1u]);  // fp16→fp32
+            for (int i=0;i<TM;i++){ float a = float(As[k][tr+i]); acc0[i]+=a*b0; acc1[i]+=a*b1; }
         }
         barrier();
     }
     for (int i=0;i<TM;i++){
         uint gr = blockRow + tr + i;
-        if (gr < p.M){ C4[gr*N4 + blockCol/4u + tcv]=acc0[i]; C4[gr*N4 + blockCol/4u + tcv+1u]=acc1[i]; }
+        if (gr < p.M){ C4[gr*N4 + blockCol/4u + tcv]=f16vec4(acc0[i]); C4[gr*N4 + blockCol/4u + tcv+1u]=f16vec4(acc1[i]); }
     }
 }

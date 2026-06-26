@@ -6,6 +6,7 @@
 #include <vector>
 #include <chrono>
 #include <cstring>
+#include <cmath>
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "VkBench", __VA_ARGS__)
 #define VK_CHECK(x) do { VkResult r = (x); if (r != VK_SUCCESS) { LOG("VK error %d at %d", r, __LINE__); return -1.0; } } while(0)
@@ -85,6 +86,28 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmul(
     Buf bA = makeBuf(phys, dev, szA, true), bB = makeBuf(phys, dev, szB, true), bC = makeBuf(phys, dev, szC, true);
     VkCommandPoolCreateInfo scpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; scpci.queueFamilyIndex=qfi;
     VkCommandPool stPool; vkCreateCommandPool(dev, &scpci, nullptr, &stPool);
+
+    // host-копии A,B (fp16) для CPU-эталона корректности
+    std::vector<__fp16> hA((size_t)M*K), hB((size_t)K*N);
+    for (size_t i=0;i<hA.size();i++) hA[i]=(__fp16)(((i*131u+7u)%17u)*0.01f - 0.08f);
+    for (size_t i=0;i<hB.size();i++) hB[i]=(__fp16)(((i*61u+13u)%19u)*0.01f - 0.09f);
+
+    auto uploadData=[&](Buf& dst, VkDeviceSize sz, const void* src){
+        Buf stg = makeBuf(phys, dev, sz, false);
+        void* p; vkMapMemory(dev, stg.mem, 0, sz, 0, &p);
+        memcpy(p, src, sz); vkUnmapMemory(dev, stg.mem);
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool=stPool; ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount=1;
+        VkCommandBuffer c; vkAllocateCommandBuffers(dev,&ai,&c);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; vkBeginCommandBuffer(c,&bi);
+        VkBufferCopy cp{0,0,sz}; vkCmdCopyBuffer(c, stg.buf, dst.buf, 1, &cp); vkEndCommandBuffer(c);
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&c;
+        vkQueueSubmit(queue,1,&si,VK_NULL_HANDLE); vkQueueWaitIdle(queue);
+        vkFreeCommandBuffers(dev,stPool,1,&c); vkDestroyBuffer(dev,stg.buf,nullptr); vkFreeMemory(dev,stg.mem,nullptr);
+    };
+    uploadData(bA, szA, hA.data());
+    uploadData(bB, szB, hB.data());
+
     auto upload=[&](Buf& dst, VkDeviceSize sz, float val, size_t n){
         Buf stg = makeBuf(phys, dev, sz, false);
         void* p; vkMapMemory(dev, stg.mem, 0, sz, 0, &p);
@@ -98,8 +121,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmul(
         vkQueueSubmit(queue,1,&si,VK_NULL_HANDLE); vkQueueWaitIdle(queue);
         vkFreeCommandBuffers(dev,stPool,1,&c); vkDestroyBuffer(dev,stg.buf,nullptr); vkFreeMemory(dev,stg.mem,nullptr);
     };
-    upload(bA, szA, 0.01f, (size_t)M*K);
-    upload(bB, szB, 0.01f, (size_t)K*N);
+    (void)upload;  // A,B уже залиты через uploadData
 
     // 6. Shader module из SPIR-V
     jsize spvLen = env->GetArrayLength(spirv);
@@ -170,6 +192,32 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmul(
     };
 
     record(); submit();  // прогрев (компиляция шейдера драйвером)
+
+    // === ВЕРИФИКАЦИЯ КОРРЕКТНОСТИ: скачать C, сверить с CPU-эталоном ===
+    {
+        Buf rb = makeBuf(phys, dev, szC, false);
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool=stPool; ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount=1;
+        VkCommandBuffer c; vkAllocateCommandBuffers(dev,&ai,&c);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; vkBeginCommandBuffer(c,&bi);
+        VkBufferCopy cp{0,0,szC}; vkCmdCopyBuffer(c, bC.buf, rb.buf, 1, &cp); vkEndCommandBuffer(c);
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&c;
+        vkQueueSubmit(queue,1,&si,VK_NULL_HANDLE); vkQueueWaitIdle(queue);
+        void* p; vkMapMemory(dev, rb.mem, 0, szC, 0, &p);
+        __fp16* C = (__fp16*)p;
+        double sumErr=0, sumRef=0; int checked=0;
+        // сверяем 16 элементов; ошибка нормируется на типичный масштаб (не на близкий к 0 ref)
+        for (int s=0;s<16;s++){
+            int r=(s*97+3)%M, col=(s*53+11)%N;
+            float ref=0; for (int k=0;k<K;k++) ref += (float)hA[(size_t)r*K+k]*(float)hB[(size_t)k*N+col];
+            float got=(float)C[(size_t)r*N+col];
+            sumErr += fabsf(ref-got); sumRef += fabsf(ref); checked++;
+        }
+        double maxRel = sumErr/(sumRef+1e-6);  // относительная L1-ошибка по выборке
+        vkUnmapMemory(dev, rb.mem);
+        vkFreeCommandBuffers(dev,stPool,1,&c); vkDestroyBuffer(dev,rb.buf,nullptr); vkFreeMemory(dev,rb.mem,nullptr);
+        LOG("CORRECTNESS %dx%dx%d: maxRelErr=%.4f (%d точек) %s", M,N,K, maxRel, checked, maxRel<0.02?"OK":"FAIL");
+    }
 
     auto t0=std::chrono::high_resolution_clock::now();
     for (int i=0;i<iters;i++){ vkResetCommandBuffer(cmd,0); record(); submit(); }
