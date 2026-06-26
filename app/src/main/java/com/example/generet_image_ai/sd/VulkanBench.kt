@@ -13,6 +13,19 @@ object VulkanBench {
     external fun benchSilu(spirv: ByteArray, n: Int, iters: Int): Double
     external fun benchGroupNorm(spirv: ByteArray, c: Int, hw: Int, g: Int, iters: Int): Double
     external fun benchAttention(spirv: ByteArray, h: Int, seqQ: Int, seqK: Int, d: Int, iters: Int): Double
+    external fun runResnetBlock(shaders: Array<ByteArray>, weights: Array<ByteArray>, c: Int, h: Int, w: Int, temb: Int): Double
+
+    fun resnetCheck(ctx: Context): String {
+        fun sh(n: String) = ctx.assets.open("shaders/$n.spv").use { it.readBytes() }
+        fun wt(n: String) = ctx.assets.open("rb/$n.bin").use { it.readBytes() }
+        val shaders = arrayOf(sh("groupnorm"), sh("silu"), sh("conv2d"), sh("matmul"), sh("addbias"), sh("add"))
+        val weights = arrayOf(
+            wt("x"), wt("temb"), wt("norm1_w"), wt("norm1_b"), wt("conv1_w"), wt("conv1_b"),
+            wt("tproj_wT"), wt("tproj_b"), wt("norm2_w"), wt("norm2_b"), wt("conv2_w"), wt("conv2_b"), wt("y"),
+        )
+        val err = runResnetBlock(shaders, weights, 320, 64, 64, 1280)
+        return "ResNet блок vs PyTorch: relErr=${"%.4f".format(err)} ${if (err < 0.03) "OK" else "FAIL"}"
+    }
 
     fun run(context: Context): String {
         val mm = context.assets.open("shaders/matmul.spv").use { it.readBytes() }
@@ -39,6 +52,7 @@ object VulkanBench {
         val at = context.assets.open("shaders/attention.spv").use { it.readBytes() }
         sb.appendLine("self-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 4096, 40, 5))} ms")
         sb.appendLine("cross-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 77, 40, 5))} ms")
+        sb.appendLine(resnetCheck(context))   // сборка ResNet блока + сверка с PyTorch
         val res = sb.toString().trim()
         Log.d("VulkanBench", res)
         return res

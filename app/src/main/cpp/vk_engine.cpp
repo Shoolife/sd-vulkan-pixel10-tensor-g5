@@ -255,6 +255,68 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchGroupNorm(
     k.destroy(c); c.free(bX);c.free(bG);c.free(bB);c.free(bY); c.destroy(); return sec*1000;
 }
 
+// ====================== JNI: RESNET BLOCK (сборка из ядер, сверка с PyTorch) ======================
+// shaders[6]: groupnorm, silu, conv2d, matmul, addbias, add
+// weights[13]: x,temb,n1w,n1b,c1w,c1b,tprojWT,tprojB,n2w,n2b,c2w,c2b,y_ref
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
+        JNIEnv* env, jobject, jobjectArray shaders, jobjectArray weights, jint C, jint H, jint W, jint Temb) {
+    VkCtx c; if(!c.init()) return -1;
+    auto getArr=[&](jobjectArray a, int i){ jbyteArray e=(jbyteArray)env->GetObjectArrayElement(a,i);
+        jsize l=env->GetArrayLength(e); std::vector<uint8_t> v(l); env->GetByteArrayRegion(e,0,l,(jbyte*)v.data()); return v; };
+    std::vector<std::vector<uint8_t>> sh(6), w(13);
+    for (int i=0;i<6;i++) sh[i]=getArr(shaders,i);
+    for (int i=0;i<13;i++) w[i]=getArr(weights,i);
+
+    uint32_t HW=(uint32_t)H*W, N=(uint32_t)C*HW, G=32;
+    auto mkW=[&](int i, VkDeviceSize bytes){ Buf b=c.alloc(bytes,true); c.upload(b,w[i].data(),bytes); return b; };
+    Buf bx=mkW(0,(VkDeviceSize)N*2), btemb=mkW(1,(VkDeviceSize)Temb*2);
+    Buf n1w=mkW(2,C*2),n1b=mkW(3,C*2), c1w=mkW(4,(VkDeviceSize)C*C*9*2),c1b=mkW(5,C*2);
+    Buf tpw=mkW(6,(VkDeviceSize)Temb*C*2),tpb=mkW(7,C*2);
+    Buf n2w=mkW(8,C*2),n2b=mkW(9,C*2), c2w=mkW(10,(VkDeviceSize)C*C*9*2),c2b=mkW(11,C*2);
+    std::vector<__fp16> yref(N); { auto& yv=w[12]; memcpy(yref.data(),yv.data(),(size_t)N*2); }
+
+    // промежуточные
+    Buf h=c.alloc((VkDeviceSize)N*2,true), hc=c.alloc((VkDeviceSize)N*2,true);
+    Buf h2=c.alloc((VkDeviceSize)N*2,true), out=c.alloc((VkDeviceSize)N*2,true);
+    Buf ts=c.alloc((VkDeviceSize)Temb*2,true), tp=c.alloc((VkDeviceSize)C*2,true);
+
+    // универсальный запуск ядра (создать pipeline, dispatch, уничтожить)
+    auto op=[&](int si, std::vector<Buf*> bufs, const void* push, uint32_t pb, uint32_t gx,uint32_t gy,uint32_t gz){
+        Kernel k; k.create(c,sh[si].data(),sh[si].size(),(int)bufs.size(),pb);
+        VkDescriptorSet ds=k.makeSet(c,bufs);
+        VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,push,gx,gy,gz); c.endCmd(cmd); k.destroy(c);
+    };
+    struct GN{uint32_t C,HW,G;float eps;}; struct CV{uint32_t Ci,Co,H,W,KH,KW,pad;};
+    struct MM{uint32_t M,N,K;}; struct AB{uint32_t C,HW;}; struct N1{uint32_t n;};
+    uint32_t gSilu=(N+255)/256, gAB=(N+255)/256;
+    GN gn{(uint32_t)C,HW,G,1e-5f}; CV cv{(uint32_t)C,(uint32_t)C,(uint32_t)H,(uint32_t)W,3,3,1};
+    uint32_t cgx=((uint32_t)W+15)/16, cgy=((uint32_t)H+15)/16, cgz=(uint32_t)C;
+
+    // --- граф ResNet ---
+    op(0,{&bx,&n1w,&n1b,&h},&gn,16,G,1,1);              // h = groupnorm(x)
+    { N1 n{N}; op(1,{&h,&h},&n,4,gSilu,1,1); }          // h = silu(h)  (in-place)
+    op(2,{&h,&c1w,&hc},&cv,28,cgx,cgy,cgz);             // hc = conv1(h)
+    { AB ab{(uint32_t)C,HW}; op(4,{&hc,&c1b},&ab,8,gAB,1,1); }  // hc += conv1_bias
+    // time embedding: ts=silu(temb); tp = ts @ tprojWT + tpb
+    { N1 n{(uint32_t)Temb}; op(1,{&btemb,&ts},&n,4,((uint32_t)Temb+255)/256,1,1); }
+    { MM mm{1,(uint32_t)C,(uint32_t)Temb}; op(3,{&ts,&tpw,&tp},&mm,12,((uint32_t)C+127)/128,1,1); }
+    { AB ab{(uint32_t)C,1}; op(4,{&tp,&tpb},&ab,8,((uint32_t)C+255)/256,1,1); }  // tp += tproj_bias
+    { AB ab{(uint32_t)C,HW}; op(4,{&hc,&tp},&ab,8,gAB,1,1); }   // hc += tp (broadcast по каналам)
+    op(0,{&hc,&n2w,&n2b,&h2},&gn,16,G,1,1);             // h2 = groupnorm(hc)
+    { N1 n{N}; op(1,{&h2,&h2},&n,4,gSilu,1,1); }        // h2 = silu(h2)
+    op(2,{&h2,&c2w,&h},&cv,28,cgx,cgy,cgz);             // h = conv2(h2)  (переиспользуем h)
+    { AB ab{(uint32_t)C,HW}; op(4,{&h,&c2b},&ab,8,gAB,1,1); }   // h += conv2_bias
+    { N1 n{N}; op(5,{&bx,&h,&out},&n,4,gSilu,1,1); }    // out = x + h
+
+    // сверка
+    std::vector<__fp16> hy(N); c.download(out,hy.data(),(VkDeviceSize)N*2);
+    double se=0,sr=0; for (uint32_t i=0;i<N;i+=37){ se+=fabsf((float)yref[i]-(float)hy[i]); sr+=fabsf((float)yref[i]); }
+    double e=se/(sr+1e-6);
+    LOG("RESNET C%d %dx%d corr=%.4f %s",C,H,W,e,e<0.03?"OK":"FAIL");
+    c.destroy(); return e;
+}
+
 // ====================== JNI: ATTENTION ======================
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_example_generet_1image_1ai_sd_VulkanBench_benchAttention(
