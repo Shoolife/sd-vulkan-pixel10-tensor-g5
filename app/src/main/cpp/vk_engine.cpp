@@ -107,7 +107,7 @@ struct Kernel {
     VkDescriptorPool dp=VK_NULL_HANDLE;
     int nBuf=0; uint32_t pcBytes=0;
 
-    void create(VkCtx& c, const void* spv, size_t spvLen, int numBuffers, uint32_t pushBytes){
+    void create(VkCtx& c, const void* spv, size_t spvLen, int numBuffers, uint32_t pushBytes, int poolSets=1){
         nBuf=numBuffers; pcBytes=pushBytes;
         VkShaderModuleCreateInfo sm_{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         sm_.codeSize=spvLen; sm_.pCode=(const uint32_t*)spv; vkCreateShaderModule(c.dev,&sm_,nullptr,&sm);
@@ -124,10 +124,11 @@ struct Kernel {
         ss.stage=VK_SHADER_STAGE_COMPUTE_BIT; ss.module=sm; ss.pName="main";
         VkComputePipelineCreateInfo cp{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO}; cp.stage=ss; cp.layout=pl;
         vkCreateComputePipelines(c.dev,VK_NULL_HANDLE,1,&cp,nullptr,&pipe);
-        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,(uint32_t)numBuffers};
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,(uint32_t)numBuffers*poolSets};
         VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpi.maxSets=1; dpi.poolSizeCount=1; dpi.pPoolSizes=&ps; vkCreateDescriptorPool(c.dev,&dpi,nullptr,&dp);
+        dpi.maxSets=poolSets; dpi.poolSizeCount=1; dpi.pPoolSizes=&ps; vkCreateDescriptorPool(c.dev,&dpi,nullptr,&dp);
     }
+    void resetPool(VkCtx& c){ vkResetDescriptorPool(c.dev,dp,0); }
     VkDescriptorSet makeSet(VkCtx& c, std::vector<Buf*> bufs){
         VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         ai.descriptorPool=dp; ai.descriptorSetCount=1; ai.pSetLayouts=&dsl;
@@ -344,10 +345,28 @@ static Buf& W(const std::string& name){
 }
 static bool has(const std::string& name){ return fsize(DIR_+"/"+name+".bin")>0; }
 static Buf mk(VkDeviceSize bytes){ Buf b=C_->alloc(bytes,true); SCRATCH_.push_back(b); return b; }
+
+// --- single-command-buffer движок: pipeline'ы кэшируются (16 шейдеров создаём 1 раз),
+//     все dispatch'и пишутся в один gCmd с барьерами памяти, submit/waitIdle 1 раз за forward ---
+static Kernel gK[NSH]; static bool gKi[NSH]={false};
+static VkCommandBuffer gCmd=VK_NULL_HANDLE;
+static const int POOL_SETS=1024;  // макс. дескрипторов одного шейдера за forward (с запасом)
+static Kernel& kern(int si,int nBuf,uint32_t pb){
+    if(!gKi[si]){ gK[si].create(*C_,(*SH_)[si].data(),(*SH_)[si].size(),nBuf,pb,POOL_SETS); gKi[si]=true; }
+    return gK[si];
+}
+// барьер write→read между операциями (compute+transfer, консервативно = идентично прежней сериализации)
+static void barrier(){
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(gCmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+}
 static void op(int si,std::vector<Buf*> bufs,const void* push,uint32_t pb,uint32_t gx,uint32_t gy,uint32_t gz){
-    Kernel k; k.create(*C_,(*SH_)[si].data(),(*SH_)[si].size(),(int)bufs.size(),pb);
-    VkDescriptorSet ds=k.makeSet(*C_,bufs); VkCommandBuffer cmd=C_->beginCmd();
-    k.record(cmd,ds,push,gx,gy,gz); C_->endCmd(cmd); k.destroy(*C_);
+    Kernel& k=kern(si,(int)bufs.size(),pb);
+    VkDescriptorSet ds=k.makeSet(*C_,bufs);
+    k.record(gCmd,ds,push,gx,gy,gz); barrier();
 }
 struct GNp{uint32_t C,HW,G;float e;}; struct CVp{uint32_t Ci,Co,H,W,KH,KW,pad,st;};
 struct ABp{uint32_t C,HW;}; struct AB2p{uint32_t n,C;}; struct T2p{uint32_t a,b;};
@@ -427,10 +446,11 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
 // concat по каналам: [Cp,HW] ++ [Cs,HW] → [(Cp+Cs),HW] (смежная память)
 static Buf concat(Buf& prev, uint32_t Cp, Buf& skip, uint32_t Cs, uint32_t HW){
     Buf out=mk((VkDeviceSize)(Cp+Cs)*HW*4);
-    VkCommandBuffer cmd=C_->beginCmd();
-    VkBufferCopy c1{0,0,(VkDeviceSize)Cp*HW*4}; vkCmdCopyBuffer(cmd,prev.buf,out.buf,1,&c1);
-    VkBufferCopy c2{0,(VkDeviceSize)Cp*HW*4,(VkDeviceSize)Cs*HW*4}; vkCmdCopyBuffer(cmd,skip.buf,out.buf,1,&c2);
-    C_->endCmd(cmd); return out;
+    barrier();  // дождаться записи prev/skip перед копированием
+    VkBufferCopy c1{0,0,(VkDeviceSize)Cp*HW*4}; vkCmdCopyBuffer(gCmd,prev.buf,out.buf,1,&c1);
+    VkBufferCopy c2{0,(VkDeviceSize)Cp*HW*4,(VkDeviceSize)Cs*HW*4}; vkCmdCopyBuffer(gCmd,skip.buf,out.buf,1,&c2);
+    barrier();  // копии видимы последующим шейдерам
+    return out;
 }
 static Buf downsample(const std::string& pf, Buf& x, uint32_t Cc, uint32_t H, uint32_t Wd){
     uint32_t Ho=H/2, Wo=Wd/2; Buf y=mk((VkDeviceSize)Cc*Ho*Wo*4);
@@ -450,7 +470,10 @@ static double corrCheck(Buf& got, const std::string& refName, uint32_t n){
 }
 // Полный UNet forward: lat[4,64,64], tembProj[320], ctx[77,768] → noise[4,64,64].
 // Использует persistent веса (WC_) и scratch (SCRATCH_).
+static void resetKernelPools(){ for(int i=0;i<NSH;i++) if(gKi[i]) gK[i].resetPool(*C_); }
 static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
+    resetKernelPools();              // дескриптор-сеты прошлого forward освобождаем
+    gCmd=C_->beginCmd();             // один command buffer на весь граф
     // time embedding MLP
     Buf t1=mk(1280*4); matmul(tembp,W("time_embedding.linear_1.weight"),t1,1,1280,320); addbias_l(t1,W("time_embedding.linear_1.bias"),1280,1280); silu(t1,1280);
     Buf temb=mk(1280*4); matmul(t1,W("time_embedding.linear_2.weight"),temb,1,1280,1280); addbias_l(temb,W("time_embedding.linear_2.bias"),1280,1280);
@@ -499,6 +522,11 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
     // ---- OUT ---- groupnorm+silu+conv_out(320→4)
     Buf gno=mk((VkDeviceSize)320*H*H*4); groupnorm(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H); silu(gno,320*H*H);
     Buf y=mk((VkDeviceSize)4*H*H*4); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,H*H);
+    // один submit на весь forward
+    vkEndCommandBuffer(gCmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&gCmd;
+    vkQueueSubmit(C_->queue,1,&si,VK_NULL_HANDLE); vkQueueWaitIdle(C_->queue);
+    vkFreeCommandBuffers(C_->dev,C_->pool,1,&gCmd); gCmd=VK_NULL_HANDLE;
     return y;
 }
 static VkCtx gCtx; static bool gInit=false;
@@ -564,6 +592,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetForward(
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_generet_1image_1ai_sd_VulkanBench_unetRelease(JNIEnv*, jobject) {
     using namespace unet; if(!gInit) return;
+    for (int i=0;i<NSH;i++) if(gKi[i]){ gK[i].destroy(gCtx); gKi[i]=false; }
     for (auto& kv: WC_) gCtx.free(kv.second); WC_.clear();
     gCtx.destroy(); gInit=false;
 }
