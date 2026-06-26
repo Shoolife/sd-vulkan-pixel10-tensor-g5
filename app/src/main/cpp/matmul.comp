@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// fp16 GEMM: workgroup 16×16, каждый поток 8 строк × 2 f16vec4 (8×8=64 выхода). Тайл 128×128.
+#define BM 128
+#define BN 128
+#define BK 16
+#define TM 8
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) readonly buffer BufA { float16_t A[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { f16vec4 B4[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { f16vec4 C4[]; };
+layout(push_constant) uniform Push { uint M, N, K; } p;
+
+shared float16_t As[BK][BM];
+shared f16vec4  Bs[BK][BN/4];
+
+void main() {
+    uint tid = gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x;
+    uint blockRow = gl_WorkGroupID.y * BM;
+    uint blockCol = gl_WorkGroupID.x * BN;
+    uint N4 = p.N / 4u;
+    uint tr  = (tid / 16u) * TM;
+    uint tcv = (tid % 16u) * 2u;
+
+    f16vec4 acc0[TM]; f16vec4 acc1[TM];
+    for (int i=0;i<TM;i++){ acc0[i]=f16vec4(0.0); acc1[i]=f16vec4(0.0); }
+
+    uint tiles = (p.K + BK - 1u) / BK;
+    for (uint t = 0u; t < tiles; t++) {
+        for (uint i = tid; i < BM*BK; i += 256u) {
+            uint r = i / BK, c = i % BK;
+            uint gr = blockRow + r, gc = t*BK + c;
+            As[c][r] = (gr < p.M && gc < p.K) ? A[gr*p.K + gc] : float16_t(0.0);
+        }
+        for (uint i = tid; i < BK*(BN/4u); i += 256u) {
+            uint r = i / (BN/4u), c = i % (BN/4u);
+            uint gr = t*BK + r; uint gcv = blockCol/4u + c;
+            Bs[r][c] = (gr < p.K && gcv < N4) ? B4[gr*N4 + gcv] : f16vec4(0.0);
+        }
+        barrier();
+        for (uint k = 0u; k < BK; k++) {
+            f16vec4 b0 = Bs[k][tcv]; f16vec4 b1 = Bs[k][tcv+1u];
+            for (int i=0;i<TM;i++){ float16_t a = As[k][tr+i]; acc0[i]+=a*b0; acc1[i]+=a*b1; }
+        }
+        barrier();
+    }
+    for (int i=0;i<TM;i++){
+        uint gr = blockRow + tr + i;
+        if (gr < p.M){ C4[gr*N4 + blockCol/4u + tcv]=acc0[i]; C4[gr*N4 + blockCol/4u + tcv+1u]=acc1[i]; }
+    }
+}

@@ -3,6 +3,13 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// MediaPipe ждёт ковариантный Any.build():Any (есть только в ПОЛНОЙ protobuf-java, не в javalite)
+configurations.all {
+    exclude(group = "com.google.protobuf", module = "protobuf-lite")
+    exclude(group = "com.google.protobuf", module = "protobuf-javalite")
+    resolutionStrategy { force("com.google.protobuf:protobuf-java:4.26.1") }
+}
+
 android {
     namespace = "com.example.generet_image_ai"
     compileSdk {
@@ -40,6 +47,9 @@ android {
         aidl = true
     }
 
+    // Собственный Vulkan compute backend (vk_bench.cpp)
+    externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
+
     // NPU-рантайм Google Tensor как dynamic feature
     dynamicFeatures.add(":litert_npu_runtime_libraries:google_tensor_runtime")
 
@@ -76,6 +86,11 @@ dependencies {
     implementation(libs.litert)
     implementation(project(":litert_npu_runtime_libraries:runtime_strings"))
     implementation("com.google.android.play:feature-delivery:2.1.0")
+
+    // MediaPipe Image Generator — нативный GPU-движок SD1.5 (бенчмарк ~15с/20шагов)
+    implementation("com.google.mediapipe:tasks-vision-image-generator:0.10.26.1")
+    // полная protobuf-java (ковариантный Any.build():Any для MediaPipe)
+    implementation("com.google.protobuf:protobuf-java:4.26.1")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

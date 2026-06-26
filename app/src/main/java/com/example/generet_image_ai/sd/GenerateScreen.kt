@@ -44,8 +44,9 @@ fun GenerateScreen(
             modifier = Modifier.fillMaxWidth(),
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(selected = s.useNpu, enabled = !s.running, onClick = { vm.setNpu(true) }, label = { Text("TPU / NPU") })
-            FilterChip(selected = !s.useNpu, enabled = !s.running, onClick = { vm.setNpu(false) }, label = { Text("GPU") })
+            FilterChip(selected = s.engine == Engine.MEDIAPIPE, enabled = !s.running, onClick = { vm.setEngine(Engine.MEDIAPIPE) }, label = { Text("MediaPipe") })
+            FilterChip(selected = s.engine == Engine.GPU_LCM, enabled = !s.running, onClick = { vm.setEngine(Engine.GPU_LCM) }, label = { Text("GPU·LCM") })
+            FilterChip(selected = s.engine == Engine.TPU, enabled = !s.running, onClick = { vm.setEngine(Engine.TPU) }, label = { Text("TPU") })
         }
         Button(onClick = vm::generate, enabled = !s.running, modifier = Modifier.fillMaxWidth()) {
             Text(if (s.running) "Генерация…" else "Сгенерировать")
@@ -55,6 +56,9 @@ fun GenerateScreen(
             OutlinedButton(onClick = vm::generate, modifier = Modifier.fillMaxWidth()) {
                 Text("↻ Ещё вариант")
             }
+        }
+        OutlinedButton(onClick = vm::benchVulkan, enabled = !s.running, modifier = Modifier.fillMaxWidth()) {
+            Text("⚡ Vulkan бенч (свой GPU)")
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (s.running) CircularProgressIndicator(modifier = Modifier.padding(2.dp))

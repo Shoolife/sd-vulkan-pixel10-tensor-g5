@@ -13,11 +13,13 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+enum class Engine { GPU_LCM, TPU, MEDIAPIPE }
+
 data class GenUiState(
     val prompt: String = "a photograph of an astronaut riding a horse",
-    val useNpu: Boolean = false,  // GPU+LCM — рабочий путь; TPU оставлен экспериментально (нестабилен на бете)
-    val steps: Int = 4,           // LCM: 4 шага = качество ~20-шагового SD1.5
-    val cfgScale: Float = 1.5f,   // умеренный CFG (LCM не терпит высокий)
+    val engine: Engine = Engine.MEDIAPIPE,  // бенчмарк нативного движка Google
+    val steps: Int = 20,          // MediaPipe: 20 шагов ~15с (бенчмарк Google)
+    val cfgScale: Float = 1.5f,
     val running: Boolean = false,
     val status: String = "Готов",
     val image: Bitmap? = null,
@@ -31,15 +33,32 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<GenUiState> = _state.asStateFlow()
 
     private val gpuPipe = GpuMonoPipeline(app)
+    private val mpPipe = MediaPipePipeline(app)
     private val tokenizer by lazy { ClipTokenizer(app) }
 
-    fun setNpu(v: Boolean) = _state.update { it.copy(useNpu = v) }
+    fun setEngine(e: Engine) = _state.update { it.copy(engine = e) }
     fun setPrompt(v: String) = _state.update { it.copy(prompt = v) }
+
+    /** Бенчмарк собственного Vulkan compute backend (фундамент своего GPU-движка). */
+    fun benchVulkan() {
+        if (_state.value.running) return
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            _state.update { it.copy(running = true, status = "Vulkan бенч…") }
+            try {
+                val res = withContext(gpuDispatcher) { VulkanBench.run(app) }
+                _state.update { it.copy(running = false, status = res) }
+            } catch (t: Throwable) {
+                android.util.Log.e("GenerateVM", "vk bench fail", t)
+                _state.update { it.copy(running = false, status = "VK ошибка: ${t.message}") }
+            }
+        }
+    }
 
     fun generate() {
         if (_state.value.running) return
         val app = getApplication<Application>()
-        val npu = _state.value.useNpu
+        val engine = _state.value.engine
         val steps = _state.value.steps
         val cfg = _state.value.cfgScale
         val prompt = _state.value.prompt.ifBlank { "a photograph" }
@@ -47,18 +66,22 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { it.copy(running = true, status = "Генерация…", image = null) }
             try {
                 val result = withContext(gpuDispatcher) {
-                    val cond = tokenizer.encode(prompt)
-                    val uncond = tokenizer.encode("")
                     val t0 = System.currentTimeMillis()
-                    val bmp = if (npu) {
-                        // TPU: экспериментальный multi-process (нестабилен на бете), оставлен для исследований
-                        MultiProcPipeline(app, useNpu = true).generate(cond, uncond, steps = steps) { i, n ->
-                            _state.update { it.copy(status = "Денойз $i/$n (TPU)…") }
+                    val bmp = when (engine) {
+                        Engine.MEDIAPIPE -> mpPipe.generate(prompt, steps, (System.nanoTime() and 0x7FFFFFFF).toInt()) { i, n ->
+                            _state.update { it.copy(status = "Денойз $i/$n (MediaPipe)…") }
                         }
-                    } else {
-                        // GPU + LCM: 4 шага = качество 20, случайный seed → новая композиция каждый раз
-                        gpuPipe.generate(cond, uncond, steps = steps, cfgScale = cfg, seed = System.nanoTime(), lcm = true) { i, n ->
-                            _state.update { it.copy(status = "Денойз $i/$n (GPU·LCM)…") }
+                        Engine.TPU -> {
+                            val cond = tokenizer.encode(prompt); val uncond = tokenizer.encode("")
+                            MultiProcPipeline(app, useNpu = true).generate(cond, uncond, steps = steps) { i, n ->
+                                _state.update { it.copy(status = "Денойз $i/$n (TPU)…") }
+                            }
+                        }
+                        Engine.GPU_LCM -> {
+                            val cond = tokenizer.encode(prompt); val uncond = tokenizer.encode("")
+                            gpuPipe.generate(cond, uncond, steps = steps, cfgScale = cfg, seed = System.nanoTime(), lcm = true) { i, n ->
+                                _state.update { it.copy(status = "Денойз $i/$n (GPU·LCM)…") }
+                            }
                         }
                     }
                     bmp to (System.currentTimeMillis() - t0)
@@ -76,5 +99,6 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         super.onCleared()
         runCatching { gpuPipe.close() }
+        runCatching { mpPipe.close() }
     }
 }
