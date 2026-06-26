@@ -12,9 +12,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 
 data class GenUiState(
+    val prompt: String = "a photograph of an astronaut riding a horse",
     val useNpu: Boolean = false,  // GPU+LCM — рабочий путь; TPU оставлен экспериментально (нестабилен на бете)
     val steps: Int = 4,           // LCM: 4 шага = качество ~20-шагового SD1.5
     val cfgScale: Float = 1.5f,   // умеренный CFG (LCM не терпит высокий)
@@ -31,8 +31,10 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<GenUiState> = _state.asStateFlow()
 
     private val gpuPipe = GpuMonoPipeline(app)
+    private val tokenizer by lazy { ClipTokenizer(app) }
 
     fun setNpu(v: Boolean) = _state.update { it.copy(useNpu = v) }
+    fun setPrompt(v: String) = _state.update { it.copy(prompt = v) }
 
     fun generate() {
         if (_state.value.running) return
@@ -40,12 +42,13 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
         val npu = _state.value.useNpu
         val steps = _state.value.steps
         val cfg = _state.value.cfgScale
+        val prompt = _state.value.prompt.ifBlank { "a photograph" }
         viewModelScope.launch {
             _state.update { it.copy(running = true, status = "Генерация…", image = null) }
             try {
                 val result = withContext(gpuDispatcher) {
-                    val cond = loadTokens("sd/tokens_astronaut.json")
-                    val uncond = loadTokens("sd/tokens_uncond.json")
+                    val cond = tokenizer.encode(prompt)
+                    val uncond = tokenizer.encode("")
                     val t0 = System.currentTimeMillis()
                     val bmp = if (npu) {
                         // TPU: экспериментальный multi-process (нестабилен на бете), оставлен для исследований
@@ -73,11 +76,5 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         super.onCleared()
         runCatching { gpuPipe.close() }
-    }
-
-    private fun loadTokens(asset: String): IntArray {
-        val txt = getApplication<Application>().assets.open(asset).bufferedReader().use { it.readText() }
-        val arr = JSONArray(txt)
-        return IntArray(arr.length()) { arr.getInt(it) }
     }
 }

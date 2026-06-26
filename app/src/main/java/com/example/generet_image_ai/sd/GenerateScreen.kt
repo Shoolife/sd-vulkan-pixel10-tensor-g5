@@ -12,6 +12,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -33,11 +35,13 @@ fun GenerateScreen(
         modifier = modifier.fillMaxWidth().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("Generet AI · SD1.5 на TPU", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Text(
-            "Промпт (демо): «a photograph of an astronaut riding a horse». " +
-                "Модели CLIP+UNet(×3)+VAE скомпилированы под Tensor G5.",
-            style = MaterialTheme.typography.bodySmall,
+        Text("Generet AI · SD1.5", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        OutlinedTextField(
+            value = s.prompt,
+            onValueChange = vm::setPrompt,
+            enabled = !s.running,
+            label = { Text("Промпт") },
+            modifier = Modifier.fillMaxWidth(),
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip(selected = s.useNpu, enabled = !s.running, onClick = { vm.setNpu(true) }, label = { Text("TPU / NPU") })
@@ -45,6 +49,12 @@ fun GenerateScreen(
         }
         Button(onClick = vm::generate, enabled = !s.running, modifier = Modifier.fillMaxWidth()) {
             Text(if (s.running) "Генерация…" else "Сгенерировать")
+        }
+        // Перегенерация: новый случайный seed → другая композиция того же промпта
+        if (s.image != null && !s.running) {
+            OutlinedButton(onClick = vm::generate, modifier = Modifier.fillMaxWidth()) {
+                Text("↻ Ещё вариант")
+            }
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (s.running) CircularProgressIndicator(modifier = Modifier.padding(2.dp))
