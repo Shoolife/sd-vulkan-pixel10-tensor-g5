@@ -46,7 +46,7 @@ class VulkanUnetPipeline(private val context: Context) {
     }
 
     private fun clipContext(tokens: IntArray, env: Environment): FloatArray {
-        val opts = CompiledModel.Options(Accelerator.GPU, Accelerator.CPU)
+        val opts = CompiledModel.Options(Accelerator.CPU)  // GPU-делегат искажает CLIP output → cross-attn не реагирует
         val m = CompiledModel.create(File(dir, "gpu_clip.tflite").absolutePath, opts, env)
         val inB = m.createInputBuffers(); val outB = m.createOutputBuffers()
         try { inB[0].writeInt(tokens); m.run(inB, outB); return outB[0].readFloat() }  // [1,77,768]

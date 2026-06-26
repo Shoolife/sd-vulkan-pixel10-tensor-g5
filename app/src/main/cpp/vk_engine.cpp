@@ -533,6 +533,16 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetSelfTest(JNIEnv*, jobject
     double e=corrCheck(noise,"OUT_y",4*64*64);
     LOG("UNET SELFTEST fp32 corr=%.4f %s",e,e<0.1?"OK":"FAIL");
     for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();
+    if (has("IN_cond")){
+        Buf l2=loadF("IN_lat",4*64*64), t2=loadF("IN_temb999",320), cc=loadF("IN_cond",77*768);
+        Buf ec=runGraph(l2,t2,cc); std::vector<float> vc(4*64*64); gCtx.download(ec,vc.data(),(VkDeviceSize)4*64*64*4);
+        for(auto&b:SCRATCH_)gCtx.free(b); SCRATCH_.clear();
+        Buf l3=loadF("IN_lat",4*64*64), t3=loadF("IN_temb999",320), uc=loadF("IN_unc",77*768);
+        Buf eu=runGraph(l3,t3,uc); std::vector<float> vu(4*64*64); gCtx.download(eu,vu.data(),(VkDeviceSize)4*64*64*4);
+        for(auto&b:SCRATCH_)gCtx.free(b); SCRATCH_.clear();
+        double d=0; for(int i=0;i<4*64*64;i++) d+=fabsf(vc[i]-vu[i]); d/=(4*64*64);
+        LOG("UNET CTX-SENS |eps_cond-eps_unc|=%.4f (PyTorch=0.0295)",d);
+    }
     return e;
 }
 
