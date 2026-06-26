@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Flash-attention (online softmax), multi-head. Layout: Q/K/V/O [H, seq, d].
+// 1 поток = (head h, строка запроса i). Не материализует scores (память O(d), не O(seq²)).
+#define MAXD 160
+layout(local_size_x = 64) in;
+layout(set=0,binding=0) readonly buffer BQ { float16_t Q[]; };
+layout(set=0,binding=1) readonly buffer BK { float16_t K[]; };
+layout(set=0,binding=2) readonly buffer BV { float16_t V[]; };
+layout(set=0,binding=3) writeonly buffer BO { float16_t O[]; };
+layout(push_constant) uniform P { uint seqQ, seqK, d, H; float scale; } p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;   // строка запроса
+    uint h = gl_GlobalInvocationID.y;   // голова
+    if (i >= p.seqQ || h >= p.H) return;
+    uint qBase = (h*p.seqQ + i)*p.d;
+    uint hkBase = h*p.seqK*p.d;
+
+    float acc[MAXD];
+    for (uint k=0u;k<p.d;k++) acc[k]=0.0;
+    float m = -3.0e38, l = 0.0;
+
+    for (uint j=0u;j<p.seqK;j++) {
+        uint kBase = hkBase + j*p.d;
+        float s = 0.0;
+        for (uint k=0u;k<p.d;k++) s += float(Q[qBase+k])*float(K[kBase+k]);
+        s *= p.scale;
+        float mnew = max(m, s);
+        float corr = exp(m - mnew);
+        float pj = exp(s - mnew);
+        l = l*corr + pj;
+        for (uint k=0u;k<p.d;k++) acc[k] = acc[k]*corr + pj*float(V[kBase+k]);
+        m = mnew;
+    }
+    uint oBase = (h*p.seqQ + i)*p.d;
+    float invl = 1.0/l;
+    for (uint k=0u;k<p.d;k++) O[oBase+k] = float16_t(acc[k]*invl);
+}

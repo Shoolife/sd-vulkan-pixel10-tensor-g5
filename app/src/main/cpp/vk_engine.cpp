@@ -255,6 +255,47 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchGroupNorm(
     k.destroy(c); c.free(bX);c.free(bG);c.free(bB);c.free(bY); c.destroy(); return sec*1000;
 }
 
+// ====================== JNI: ATTENTION ======================
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_benchAttention(
+        JNIEnv* env, jobject, jbyteArray spirv, jint H, jint seqQ, jint seqK, jint d, jint iters) {
+    VkCtx c; if(!c.init()) return -1;
+    jsize l=env->GetArrayLength(spirv); std::vector<uint8_t> spv(l); env->GetByteArrayRegion(spirv,0,l,(jbyte*)spv.data());
+    VkDeviceSize szQ=(VkDeviceSize)H*seqQ*d*2, szK=(VkDeviceSize)H*seqK*d*2, szO=szQ;
+    Buf bQ=c.alloc(szQ,true), bK=c.alloc(szK,true), bV=c.alloc(szK,true), bO=c.alloc(szO,true);
+    std::vector<__fp16> hQ((size_t)H*seqQ*d), hK((size_t)H*seqK*d), hV((size_t)H*seqK*d);
+    for(size_t i=0;i<hQ.size();i++) hQ[i]=(__fp16)(((i*131u+7u)%23u)*0.05f-0.55f);
+    for(size_t i=0;i<hK.size();i++) hK[i]=(__fp16)(((i*61u+13u)%19u)*0.05f-0.45f);
+    for(size_t i=0;i<hV.size();i++) hV[i]=(__fp16)(((i*97u+5u)%17u)*0.05f-0.4f);
+    c.upload(bQ,hQ.data(),szQ); c.upload(bK,hK.data(),szK); c.upload(bV,hV.data(),szK);
+
+    Kernel k; k.create(c,spv.data(),spv.size(),4,20); VkDescriptorSet ds=k.makeSet(c,{&bQ,&bK,&bV,&bO});
+    float scale=1.0f/sqrtf((float)d);
+    struct { uint32_t sQ,sK,d,H; float sc; } pc{(uint32_t)seqQ,(uint32_t)seqK,(uint32_t)d,(uint32_t)H,scale};
+    uint32_t gx=((uint32_t)seqQ+63)/64, gy=(uint32_t)H;
+
+    { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,&pc,gx,gy,1); c.endCmd(cmd); }
+    // верификация: эталонный softmax-attention на CPU для нескольких (h,i,k)
+    { std::vector<__fp16> hO((size_t)H*seqQ*d); c.download(bO,hO.data(),szO);
+      double se=0,sr=0;
+      for (int t=0;t<8;t++){
+          int h=(t)%H, i=(t*53+1)%seqQ, kk=(t*29+2)%d;
+          std::vector<float> sc(seqK); float mx=-1e30f;
+          for (int j=0;j<seqK;j++){ float s=0; for(int q=0;q<d;q++) s+=(float)hQ[((size_t)h*seqQ+i)*d+q]*(float)hK[((size_t)h*seqK+j)*d+q];
+              s*=scale; sc[j]=s; if(s>mx)mx=s; }
+          float sum=0; for(int j=0;j<seqK;j++){ sc[j]=expf(sc[j]-mx); sum+=sc[j]; }
+          float ref=0; for(int j=0;j<seqK;j++) ref += sc[j]/sum*(float)hV[((size_t)h*seqK+j)*d+kk];
+          se+=fabsf(ref-(float)hO[((size_t)h*seqQ+i)*d+kk]); sr+=fabsf(ref);
+      }
+      double e=se/(sr+1e-6); LOG("ATTN H%d sQ%d sK%d d%d corr=%.4f %s",H,seqQ,seqK,d,e,e<0.03?"OK":"FAIL"); }
+
+    double sec=timeDispatch(c,k,ds,&pc,gx,gy,1,iters);
+    // FLOPS attention ~ 2*H*seqQ*seqK*d (QK) + 2*H*seqQ*seqK*d (AV)
+    double flops=4.0*(double)H*seqQ*seqK*d;
+    LOG("attn H%d sQ%d sK%d d%d: %.3f ms, %.1f GFLOPS",H,seqQ,seqK,d,sec*1000,flops/sec/1e9);
+    k.destroy(c); c.free(bQ);c.free(bK);c.free(bV);c.free(bO); c.destroy(); return sec*1000;
+}
+
 // ====================== JNI: CONV через im2col + GEMM ======================
 // Принимает 2 SPIR-V: im2col и matmul. conv → Col[K,Ncol] → Y=W×Col.
 extern "C" JNIEXPORT jdouble JNICALL

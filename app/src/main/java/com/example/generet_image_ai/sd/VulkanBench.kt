@@ -12,6 +12,7 @@ object VulkanBench {
     external fun benchConvGemm(im2col: ByteArray, matmul: ByteArray, cin: Int, cout: Int, h: Int, w: Int, kh: Int, kw: Int, iters: Int): Double
     external fun benchSilu(spirv: ByteArray, n: Int, iters: Int): Double
     external fun benchGroupNorm(spirv: ByteArray, c: Int, hw: Int, g: Int, iters: Int): Double
+    external fun benchAttention(spirv: ByteArray, h: Int, seqQ: Int, seqK: Int, d: Int, iters: Int): Double
 
     fun run(context: Context): String {
         val mm = context.assets.open("shaders/matmul.spv").use { it.readBytes() }
@@ -34,6 +35,10 @@ object VulkanBench {
         sb.appendLine("silu 320×64²: ${"%.2f".format(benchSilu(si, 320 * 64 * 64, 30))} ms")
         sb.appendLine("groupnorm 320×64² g32: ${"%.2f".format(benchGroupNorm(gn, 320, 64 * 64, 32, 30))} ms")
         sb.appendLine("groupnorm 1280×16² g32: ${"%.2f".format(benchGroupNorm(gn, 1280, 16 * 16, 32, 30))} ms")
+        // attention: self (seq=4096, d=40, 8 голов) и cross (seqK=77)
+        val at = context.assets.open("shaders/attention.spv").use { it.readBytes() }
+        sb.appendLine("self-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 4096, 40, 5))} ms")
+        sb.appendLine("cross-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 77, 40, 5))} ms")
         val res = sb.toString().trim()
         Log.d("VulkanBench", res)
         return res
