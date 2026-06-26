@@ -1,30 +1,22 @@
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-// Прямой conv2d: X[Cin,H,W] * W[Cout,Cin,KH,KW] -> Y[Cout,H,W], same pad, stride 1.
-// gl_GlobalInvocationID: x=ox, y=oy, z=co. fp16 storage, fp32 acc.
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(set=0,binding=0) readonly buffer BX { float16_t X[]; };
 layout(set=0,binding=1) readonly buffer BW { float16_t Wt[]; };
 layout(set=0,binding=2) writeonly buffer BY { float16_t Y[]; };
-layout(push_constant) uniform P { uint Cin, Cout, H, W, KH, KW, pad; } p;
-
+layout(push_constant) uniform P { uint Cin, Cout, Hin, Win, KH, KW, pad, stride; } p;
 void main() {
+    uint Hout=(p.Hin+2u*p.pad-p.KH)/p.stride+1u;
+    uint Wout=(p.Win+2u*p.pad-p.KW)/p.stride+1u;
     uint ox=gl_GlobalInvocationID.x, oy=gl_GlobalInvocationID.y, co=gl_GlobalInvocationID.z;
-    if (ox>=p.W || oy>=p.H || co>=p.Cout) return;
+    if (ox>=Wout||oy>=Hout||co>=p.Cout) return;
     float acc=0.0;
-    for (uint ci=0u; ci<p.Cin; ci++) {
-        uint xBase=ci*p.H*p.W;
-        uint wBase=((co*p.Cin)+ci)*p.KH*p.KW;
-        for (uint ky=0u; ky<p.KH; ky++) {
-            int iy=int(oy)+int(ky)-int(p.pad);
-            if (iy<0||iy>=int(p.H)) continue;
-            for (uint kx=0u; kx<p.KW; kx++) {
-                int ix=int(ox)+int(kx)-int(p.pad);
-                if (ix<0||ix>=int(p.W)) continue;
-                acc += float(X[xBase + uint(iy)*p.W + uint(ix)]) * float(Wt[wBase + ky*p.KW + kx]);
-            }
-        }
+    for (uint ci=0u; ci<p.Cin; ci++){
+        uint xb=ci*p.Hin*p.Win, wb=((co*p.Cin)+ci)*p.KH*p.KW;
+        for (uint ky=0u; ky<p.KH; ky++){ int iy=int(oy*p.stride+ky)-int(p.pad); if(iy<0||iy>=int(p.Hin)) continue;
+            for (uint kx=0u; kx<p.KW; kx++){ int ix=int(ox*p.stride+kx)-int(p.pad); if(ix<0||ix>=int(p.Win)) continue;
+                acc += float(X[xb+uint(iy)*p.Win+uint(ix)])*float(Wt[wb+ky*p.KW+kx]); } }
     }
-    Y[(co*p.H + oy)*p.W + ox] = float16_t(acc);
+    Y[(co*Hout+oy)*Wout+ox]=float16_t(acc);
 }

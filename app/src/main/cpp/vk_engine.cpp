@@ -287,16 +287,16 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
         VkDescriptorSet ds=k.makeSet(c,bufs);
         VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,push,gx,gy,gz); c.endCmd(cmd); k.destroy(c);
     };
-    struct GN{uint32_t C,HW,G;float eps;}; struct CV{uint32_t Ci,Co,H,W,KH,KW,pad;};
+    struct GN{uint32_t C,HW,G;float eps;}; struct CV{uint32_t Ci,Co,H,W,KH,KW,pad,stride;};
     struct MM{uint32_t M,N,K;}; struct AB{uint32_t C,HW;}; struct N1{uint32_t n;};
     uint32_t gSilu=(N+255)/256, gAB=(N+255)/256;
-    GN gn{(uint32_t)C,HW,G,1e-5f}; CV cv{(uint32_t)C,(uint32_t)C,(uint32_t)H,(uint32_t)W,3,3,1};
+    GN gn{(uint32_t)C,HW,G,1e-5f}; CV cv{(uint32_t)C,(uint32_t)C,(uint32_t)H,(uint32_t)W,3,3,1,1};
     uint32_t cgx=((uint32_t)W+15)/16, cgy=((uint32_t)H+15)/16, cgz=(uint32_t)C;
 
     // --- граф ResNet ---
     op(0,{&bx,&n1w,&n1b,&h},&gn,16,G,1,1);              // h = groupnorm(x)
     { N1 n{N}; op(1,{&h,&h},&n,4,gSilu,1,1); }          // h = silu(h)  (in-place)
-    op(2,{&h,&c1w,&hc},&cv,28,cgx,cgy,cgz);             // hc = conv1(h)
+    op(2,{&h,&c1w,&hc},&cv,32,cgx,cgy,cgz);             // hc = conv1(h)
     { AB ab{(uint32_t)C,HW}; op(4,{&hc,&c1b},&ab,8,gAB,1,1); }  // hc += conv1_bias
     // time embedding: ts=silu(temb); tp = ts @ tprojWT + tpb
     { N1 n{(uint32_t)Temb}; op(1,{&btemb,&ts},&n,4,((uint32_t)Temb+255)/256,1,1); }
@@ -305,7 +305,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
     { AB ab{(uint32_t)C,HW}; op(4,{&hc,&tp},&ab,8,gAB,1,1); }   // hc += tp (broadcast по каналам)
     op(0,{&hc,&n2w,&n2b,&h2},&gn,16,G,1,1);             // h2 = groupnorm(hc)
     { N1 n{N}; op(1,{&h2,&h2},&n,4,gSilu,1,1); }        // h2 = silu(h2)
-    op(2,{&h2,&c2w,&h},&cv,28,cgx,cgy,cgz);             // h = conv2(h2)  (переиспользуем h)
+    op(2,{&h2,&c2w,&h},&cv,32,cgx,cgy,cgz);             // h = conv2(h2)  (переиспользуем h)
     { AB ab{(uint32_t)C,HW}; op(4,{&h,&c2b},&ab,8,gAB,1,1); }   // h += conv2_bias
     { N1 n{N}; op(5,{&bx,&h,&out},&n,4,gSilu,1,1); }    // out = x + h
 
@@ -315,6 +315,152 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
     double e=se/(sr+1e-6);
     LOG("RESNET C%d %dx%d corr=%.4f %s",C,H,W,e,e<0.03?"OK":"FAIL");
     c.destroy(); return e;
+}
+
+// ====================== ГРАФ-ДВИЖОК UNet ======================
+#include <string>
+#include <map>
+#include <cstdio>
+#include <cerrno>
+namespace unet {
+// шейдеры по индексу (порядок задаёт Kotlin)
+enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, NSH };
+static VkCtx* C_; static std::vector<std::vector<uint8_t>>* SH_; static std::string DIR_;
+static std::map<std::string,Buf> WC_;  // кэш весов
+
+static int64_t fsize(const std::string& p){ FILE* f=fopen(p.c_str(),"rb"); if(!f)return -1; fseek(f,0,SEEK_END); int64_t s=ftell(f); fclose(f); return s; }
+// загрузка веса по имени (lazy, device-local)
+static Buf& W(const std::string& name){
+    auto it=WC_.find(name); if(it!=WC_.end()) return it->second;
+    std::string p=DIR_+"/"+name+".bin"; int64_t sz=fsize(p);
+    if (sz<0){ LOG("WEIGHT MISSING %s",name.c_str()); }
+    std::vector<uint8_t> buf(sz>0?sz:2);
+    if (sz>0){ FILE* f=fopen(p.c_str(),"rb"); fread(buf.data(),1,sz,f); fclose(f); }
+    Buf b=C_->alloc(buf.size(),true); C_->upload(b,buf.data(),buf.size());
+    WC_[name]=b; return WC_[name];
+}
+static bool has(const std::string& name){ return fsize(DIR_+"/"+name+".bin")>0; }
+static Buf mk(VkDeviceSize bytes){ return C_->alloc(bytes,true); }
+static void op(int si,std::vector<Buf*> bufs,const void* push,uint32_t pb,uint32_t gx,uint32_t gy,uint32_t gz){
+    Kernel k; k.create(*C_,(*SH_)[si].data(),(*SH_)[si].size(),(int)bufs.size(),pb);
+    VkDescriptorSet ds=k.makeSet(*C_,bufs); VkCommandBuffer cmd=C_->beginCmd();
+    k.record(cmd,ds,push,gx,gy,gz); C_->endCmd(cmd); k.destroy(*C_);
+}
+struct GNp{uint32_t C,HW,G;float e;}; struct CVp{uint32_t Ci,Co,H,W,KH,KW,pad,st;};
+struct ABp{uint32_t C,HW;}; struct AB2p{uint32_t n,C;}; struct T2p{uint32_t a,b;};
+struct LNp{uint32_t tok,C;float e;}; struct MMp{uint32_t M,N,K;}; struct SHp{uint32_t seq,nh,d;};
+struct ATp{uint32_t sQ,sK,d,H;float sc;}; struct N1p{uint32_t n;}; struct GGp{uint32_t tok,C2;};
+static void silu(Buf& x,uint32_t n){ N1p p{n}; op(SILU,{&x,&x},&p,4,(n+255)/256,1,1); }
+static void groupnorm(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp p{Cc,HW,32,1e-5f}; op(GN,{&x,&g,&b,&y},&p,16,32,1,1); }
+static void conv(Buf& x,Buf& w,Buf& y,uint32_t Ci,uint32_t Co,uint32_t H,uint32_t Wd,uint32_t K,uint32_t pad,uint32_t st){
+    CVp p{Ci,Co,H,Wd,K,K,pad,st}; uint32_t Ho=(H+2*pad-K)/st+1, Wo=(Wd+2*pad-K)/st+1;
+    op(CONV,{&x,&w,&y},&p,32,(Wo+15)/16,(Ho+15)/16,Co); }
+static void addbias_c(Buf& y,Buf& b,uint32_t Cc,uint32_t HW){ ABp p{Cc,HW}; op(AB,{&y,&b},&p,8,(Cc*HW+255)/256,1,1); }
+static void addbias_l(Buf& y,Buf& b,uint32_t n,uint32_t Cc){ AB2p p{n,Cc}; op(AB2,{&y,&b},&p,8,(n+255)/256,1,1); }
+static void addv(Buf& a,Buf& b,Buf& y,uint32_t n){ N1p p{n}; op(ADD,{&a,&b,&y},&p,4,(n+255)/256,1,1); }
+static void matmul(Buf& a,Buf& b,Buf& y,uint32_t M,uint32_t N,uint32_t K){ MMp p{M,N,K}; op(MM,{&a,&b,&y},&p,12,(N+127)/128,(M+127)/128,1); }
+
+// ResNet-блок: x[Cin,H,W] + temb[1280] → out[Cout,H,W]
+static Buf resnet(const std::string& pf, Buf& x, Buf& temb, uint32_t Cin, uint32_t Cout, uint32_t H, uint32_t Wd){
+    uint32_t HWi=H*Wd, Ni=Cin*HWi, No=Cout*HWi;
+    Buf h=mk((VkDeviceSize)Ni*2); groupnorm(x,W(pf+".norm1.weight"),W(pf+".norm1.bias"),h,Cin,HWi); silu(h,Ni);
+    Buf hc=mk((VkDeviceSize)No*2); conv(h,W(pf+".conv1.weight"),hc,Cin,Cout,H,Wd,3,1,1); addbias_c(hc,W(pf+".conv1.bias"),Cout,HWi);
+    // time emb
+    Buf ts=mk(1280*2); { N1p p{1280}; op(SILU,{&temb,&ts},&p,4,(1280+255)/256,1,1); }
+    Buf tp=mk((VkDeviceSize)Cout*2); matmul(ts,W(pf+".time_emb_proj.weight"),tp,1,Cout,1280); addbias_l(tp,W(pf+".time_emb_proj.bias"),Cout,Cout);
+    { ABp p{Cout,HWi}; op(AB,{&hc,&tp},&p,8,(No+255)/256,1,1); }   // hc += tp broadcast
+    Buf h2=mk((VkDeviceSize)No*2); groupnorm(hc,W(pf+".norm2.weight"),W(pf+".norm2.bias"),h2,Cout,HWi); silu(h2,No);
+    Buf hc2=mk((VkDeviceSize)No*2); conv(h2,W(pf+".conv2.weight"),hc2,Cout,Cout,H,Wd,3,1,1); addbias_c(hc2,W(pf+".conv2.bias"),Cout,HWi);
+    Buf out=mk((VkDeviceSize)No*2);
+    if (Cin!=Cout){ Buf sx=mk((VkDeviceSize)No*2); conv(x,W(pf+".conv_shortcut.weight"),sx,Cin,Cout,H,Wd,1,0,1); addbias_c(sx,W(pf+".conv_shortcut.bias"),Cout,HWi); addv(sx,hc2,out,No); }
+    else addv(x,hc2,out,No);
+    return out;
+}
+
+// Transformer-блок (SpatialTransformer): x[C,H,W] + ctx[77,768] → out[C,H,W]
+static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uint32_t H, uint32_t Wd, uint32_t nh){
+    uint32_t HW=H*Wd, N=Cc*HW, d=Cc/nh, ctxN=77, C2=Cc*4, PROJ=Cc*8;
+    Buf g1=mk((VkDeviceSize)N*2); groupnorm(x,W(pf+".norm.weight"),W(pf+".norm.bias"),g1,Cc,HW);
+    Buf p1=mk((VkDeviceSize)N*2); conv(g1,W(pf+".proj_in.weight"),p1,Cc,Cc,H,Wd,1,0,1); addbias_c(p1,W(pf+".proj_in.bias"),Cc,HW);
+    Buf t=mk((VkDeviceSize)N*2); { T2p p{Cc,HW}; op(T_CH,{&p1,&t},&p,8,(N+255)/256,1,1); }
+    std::string b=pf+".transformer_blocks.0";
+    Buf h=mk((VkDeviceSize)N*2),q=mk((VkDeviceSize)N*2),k=mk((VkDeviceSize)N*2),v=mk((VkDeviceSize)N*2),a=mk((VkDeviceSize)N*2);
+    Buf qh=mk((VkDeviceSize)N*2),kh=mk((VkDeviceSize)N*2),vh=mk((VkDeviceSize)N*2),ah=mk((VkDeviceSize)N*2);
+    auto split=[&](Buf& src,Buf& dst,uint32_t seq){ SHp p{seq,nh,d}; op(SPLIT,{&src,&dst},&p,12,(seq*nh*d+255)/256,1,1); };
+    auto merge=[&](Buf& src,Buf& dst,uint32_t seq){ SHp p{seq,nh,d}; op(MERGE,{&src,&dst},&p,12,(seq*nh*d+255)/256,1,1); };
+    // self-attn
+    { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm1.weight"),&W(b+".norm1.bias"),&h},&p,12,HW,1,1); }
+    matmul(h,W(b+".attn1.to_q.weight"),q,HW,Cc,Cc); matmul(h,W(b+".attn1.to_k.weight"),k,HW,Cc,Cc); matmul(h,W(b+".attn1.to_v.weight"),v,HW,Cc,Cc);
+    split(q,qh,HW); split(k,kh,HW); split(v,vh,HW);
+    { ATp p{HW,HW,d,nh,1.0f/sqrtf((float)d)}; op(ATTN,{&qh,&kh,&vh,&ah},&p,20,(HW+63)/64,nh,1); }
+    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*2); matmul(a,W(b+".attn1.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn1.to_out.0.bias"),N,Cc); addv(t,ao,t,N); C_->free(ao); }
+    // cross-attn
+    { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm2.weight"),&W(b+".norm2.bias"),&h},&p,12,HW,1,1); }
+    matmul(h,W(b+".attn2.to_q.weight"),q,HW,Cc,Cc);
+    Buf kc=mk((VkDeviceSize)ctxN*Cc*2),vc=mk((VkDeviceSize)ctxN*Cc*2),khc=mk((VkDeviceSize)ctxN*Cc*2),vhc=mk((VkDeviceSize)ctxN*Cc*2);
+    matmul(ctx,W(b+".attn2.to_k.weight"),kc,ctxN,Cc,768); matmul(ctx,W(b+".attn2.to_v.weight"),vc,ctxN,Cc,768);
+    split(q,qh,HW); split(kc,khc,ctxN); split(vc,vhc,ctxN);
+    { ATp p{HW,ctxN,d,nh,1.0f/sqrtf((float)d)}; op(ATTN,{&qh,&khc,&vhc,&ah},&p,20,(HW+63)/64,nh,1); }
+    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*2); matmul(a,W(b+".attn2.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn2.to_out.0.bias"),N,Cc); addv(t,ao,t,N); C_->free(ao); }
+    // ff GEGLU
+    { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm3.weight"),&W(b+".norm3.bias"),&h},&p,12,HW,1,1); }
+    Buf gg=mk((VkDeviceSize)HW*PROJ*2); matmul(h,W(b+".ff.net.0.proj.weight"),gg,HW,PROJ,Cc); addbias_l(gg,W(b+".ff.net.0.proj.bias"),HW*PROJ,PROJ);
+    Buf gf=mk((VkDeviceSize)HW*C2*2); { GGp p{HW,C2}; op(GEGLU,{&gg,&gf},&p,8,(HW*C2+255)/256,1,1); }
+    Buf ff=mk((VkDeviceSize)N*2); matmul(gf,W(b+".ff.net.2.weight"),ff,HW,Cc,C2); addbias_l(ff,W(b+".ff.net.2.bias"),N,Cc); addv(t,ff,t,N);
+    // proj_out + residual
+    Buf tt=mk((VkDeviceSize)N*2); { T2p p{HW,Cc}; op(T_HC,{&t,&tt},&p,8,(N+255)/256,1,1); }
+    Buf po=mk((VkDeviceSize)N*2); conv(tt,W(pf+".proj_out.weight"),po,Cc,Cc,H,Wd,1,0,1); addbias_c(po,W(pf+".proj_out.bias"),Cc,HW);
+    Buf out=mk((VkDeviceSize)N*2); addv(x,po,out,N);
+    return out;
+}
+
+static double corrCheck(Buf& got, const std::string& refName, uint32_t n){
+    std::string p=DIR_+"/"+refName+".bin"; int64_t sz=fsize(p); if(sz<0) return -1;
+    std::vector<__fp16> ref(sz/2); FILE* f=fopen(p.c_str(),"rb"); fread(ref.data(),1,sz,f); fclose(f);
+    std::vector<__fp16> hy(n); C_->download(got,hy.data(),(VkDeviceSize)n*2);
+    double se=0,sr=0; for(uint32_t i=0;i<n;i+=17){ se+=fabsf((float)ref[i]-(float)hy[i]); sr+=fabsf((float)ref[i]); }
+    return se/(sr+1e-6);
+}
+} // namespace unet
+
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_runUNetDown0(
+        JNIEnv* env, jobject, jobjectArray shaders, jstring dir) {
+    using namespace unet;
+    VkCtx c; if(!c.init()) return -1; C_=&c;
+    static std::vector<std::vector<uint8_t>> sh; sh.assign(NSH,{});
+    for (int i=0;i<NSH;i++){ jbyteArray e=(jbyteArray)env->GetObjectArrayElement(shaders,i);
+        jsize l=env->GetArrayLength(e); sh[i].resize(l); env->GetByteArrayRegion(e,0,l,(jbyte*)sh[i].data()); }
+    SH_=&sh;
+    const char* cd=env->GetStringUTFChars(dir,nullptr); DIR_=cd; env->ReleaseStringUTFChars(dir,cd);
+    WC_.clear();
+    LOG("UNET dir=%s  IN_lat.bin size=%lld", DIR_.c_str(), (long long)fsize(DIR_+"/IN_lat.bin"));
+
+    // вход
+    auto load=[&](const std::string& nm, uint32_t n){ Buf b=mk((VkDeviceSize)n*2);
+        std::string p=DIR_+"/"+nm+".bin"; FILE* f=fopen(p.c_str(),"rb");
+        if(!f){ LOG("FOPEN FAIL %s errno=%d",p.c_str(),errno); return b; }
+        std::vector<uint8_t> v((size_t)n*2); fread(v.data(),1,v.size(),f); fclose(f); c.upload(b,v.data(),v.size()); return b; };
+    Buf lat=load("IN_lat",4*64*64), ctx=load("IN_ctx",77*768), tembp=load("IN_temb_proj",320);
+    // time embedding MLP: linear_1(320→1280)+silu+linear_2(1280→1280)
+    Buf t1=mk(1280*2); matmul(tembp,W("time_embedding.linear_1.weight"),t1,1,1280,320); addbias_l(t1,W("time_embedding.linear_1.bias"),1280,1280); silu(t1,1280);
+    Buf temb=mk(1280*2); matmul(t1,W("time_embedding.linear_2.weight"),temb,1,1280,1280); addbias_l(temb,W("time_embedding.linear_2.bias"),1280,1280);
+    LOG("UNET temb corr=%.4f",corrCheck(temb,"INT_temb",1280));
+    // conv_in: 4→320
+    Buf x=mk((VkDeviceSize)320*64*64*2); conv(lat,W("conv_in.weight"),x,4,320,64,64,3,1,1); addbias_c(x,W("conv_in.bias"),320,64*64);
+    double e_ci=corrCheck(x,"INT_conv_in",320*64*64); LOG("UNET conv_in corr=%.4f",e_ci);
+    // down[0]: 2×(resnet 320→320 + transformer 320), downsample 320→320 stride2
+    Buf r0=resnet("down_blocks.0.resnets.0",x,temb,320,320,64,64);
+    LOG("UNET d0.r0 corr=%.4f",corrCheck(r0,"INT_d0_r0",320*64*64));
+    Buf a0=transformer("down_blocks.0.attentions.0",r0,ctx,320,64,64,8);
+    LOG("UNET d0.a0 corr=%.4f",corrCheck(a0,"INT_d0_a0",320*64*64));
+    Buf r1=resnet("down_blocks.0.resnets.1",a0,temb,320,320,64,64);
+    LOG("UNET d0.r1 corr=%.4f",corrCheck(r1,"INT_d0_r1",320*64*64));
+    Buf a1=transformer("down_blocks.0.attentions.1",r1,ctx,320,64,64,8);
+    LOG("UNET d0.a1 corr=%.4f",corrCheck(a1,"INT_d0_a1",320*64*64));
+    Buf ds=mk((VkDeviceSize)320*32*32*2); conv(a1,W("down_blocks.0.downsamplers.0.conv.weight"),ds,320,320,64,64,3,1,2); addbias_c(ds,W("down_blocks.0.downsamplers.0.conv.bias"),320,32*32);
+    double e_d0=corrCheck(ds,"INT_down0",320*32*32); LOG("UNET down0 corr=%.4f %s",e_d0,e_d0<0.08?"OK":"FAIL");
+    c.destroy(); return e_d0;
 }
 
 // ====================== JNI: TRANSFORMER BLOCK ======================
@@ -353,7 +499,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runTransformerBlock(
         VkDescriptorSet ds=kr.makeSet(c,bufs); VkCommandBuffer cmd=c.beginCmd();
         kr.record(cmd,ds,push,gx,gy,gz); c.endCmd(cmd); kr.destroy(c); };
     // push-структуры
-    struct GN{uint32_t C,HW,G;float e;}; struct CV{uint32_t Ci,Co,H,W,KH,KW,pad;};
+    struct GN{uint32_t C,HW,G;float e;}; struct CV{uint32_t Ci,Co,H,W,KH,KW,pad,stride;};
     struct AB{uint32_t C,HW;}; struct AB2{uint32_t n,C;}; struct T2{uint32_t a,b;};
     struct LN{uint32_t tok,C;float e;}; struct MM{uint32_t M,N,K;}; struct SH{uint32_t seq,nh,d;};
     struct AT{uint32_t sQ,sK,d,H;float sc;}; struct N1{uint32_t n;}; struct GG{uint32_t tok,C2;};
@@ -362,7 +508,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runTransformerBlock(
 
     // --- граф ---
     { GN gn{(uint32_t)C,HW,32,1e-5f}; op(0,{&bx,&gnw,&gnb,&g1},&gn,16,32,1,1); }     // groupnorm
-    { CV cv{(uint32_t)C,(uint32_t)C,(uint32_t)H,(uint32_t)W,1,1,0}; op(1,{&g1,&pinw,&p1},&cv,28,((uint32_t)W+15)/16,((uint32_t)H+15)/16,(uint32_t)C); } // proj_in conv1x1
+    { CV cv{(uint32_t)C,(uint32_t)C,(uint32_t)H,(uint32_t)W,1,1,0,1}; op(1,{&g1,&pinw,&p1},&cv,32,((uint32_t)W+15)/16,((uint32_t)H+15)/16,(uint32_t)C); } // proj_in conv1x1
     { AB ab{(uint32_t)C,HW}; op(2,{&p1,&pinb},&ab,8,g_chw,1,1); }
     { T2 tr{(uint32_t)C,HW}; op(4,{&p1,&t},&tr,8,g_chw,1,1); }                        // [C,HW]→[HW,C]
     // self-attn
@@ -393,7 +539,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runTransformerBlock(
       N1 n{HW*(uint32_t)C}; op(10,{&t,&ff,&t},&n,4,g_tok,1,1); }
     // proj_out + residual
     { T2 tr{HW,(uint32_t)C}; op(11,{&t,&tt},&tr,8,g_tok,1,1); }                       // [HW,C]→[C,HW]
-    { CV cv{(uint32_t)C,(uint32_t)C,(uint32_t)H,(uint32_t)W,1,1,0}; op(1,{&tt,&poutw,&po},&cv,28,((uint32_t)W+15)/16,((uint32_t)H+15)/16,(uint32_t)C); }
+    { CV cv{(uint32_t)C,(uint32_t)C,(uint32_t)H,(uint32_t)W,1,1,0,1}; op(1,{&tt,&poutw,&po},&cv,32,((uint32_t)W+15)/16,((uint32_t)H+15)/16,(uint32_t)C); }
     { AB ab{(uint32_t)C,HW}; op(2,{&po,&poutb},&ab,8,g_chw,1,1); }
     { N1 n{(uint32_t)C*HW}; op(10,{&bx,&po,&out},&n,4,g_chw,1,1); }
 
@@ -523,9 +669,9 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchConv(
     for (size_t i=0;i<hW.size();i++) hW[i]=(__fp16)(((i*61u+13u)%19u)*0.02f-0.18f);
     c.upload(bX,hX.data(),szX); c.upload(bW,hW.data(),szW);
 
-    Kernel k; k.create(c,spv.data(),spvLen,3,28);  // push: Cin,Cout,H,W,KH,KW,pad
+    Kernel k; k.create(c,spv.data(),spvLen,3,32);  // push: Cin,Cout,H,W,KH,KW,pad,stride
     VkDescriptorSet ds=k.makeSet(c,{&bX,&bW,&bY});
-    uint32_t pc[7]={(uint32_t)Cin,(uint32_t)Cout,(uint32_t)H,(uint32_t)W,(uint32_t)KH,(uint32_t)KW,(uint32_t)pad};
+    uint32_t pc[8]={(uint32_t)Cin,(uint32_t)Cout,(uint32_t)H,(uint32_t)W,(uint32_t)KH,(uint32_t)KW,(uint32_t)pad,1u};
     uint32_t gx=((uint32_t)W+15)/16, gy=((uint32_t)H+15)/16, gz=(uint32_t)Cout;
 
     { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,pc,gx,gy,gz); c.endCmd(cmd); }
