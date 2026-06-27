@@ -87,8 +87,8 @@ class VulkanUnetPipeline(private val context: Context) {
             latents = sched.step(latents, eps, noise)
             Log.d(tag, "step ${idx + 1}/$steps done")
         }
-        VulkanBench.unetRelease()  // освобождаем 1.7ГБ весов перед VAE
-        // VAE в своём env
+        // веса НЕ освобождаем — остаются резидентны для след. генерации (экономит ~39с перезагрузки)
+        // VAE в своём env (16ГБ unified хватает на 3.4ГБ весов + VAE)
         val env2 = Environment.create()
         val img = try { vaeDecode(latents, env2) } finally { env2.close() }
         Log.d(tag, "vae done")
