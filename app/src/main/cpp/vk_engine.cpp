@@ -413,9 +413,10 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
 #include <cerrno>
 namespace unet {
 // шейдеры по индексу (порядок задаёт Kotlin)
-enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, IM2COL, NSH };
+enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, IM2COL, WIN_IN, MM_WINO, WIN_OUT, WIN_WT, NSH };
 static VkCtx* C_; static std::vector<std::vector<uint8_t>>* SH_; static std::string DIR_;
 static std::map<std::string,Buf> WC_;  // кэш весов (персистентный)
+static std::map<uint64_t,Buf> WCW_;    // кэш Winograd-трансформированных весов U (по buf-хэндлу)
 static std::vector<Buf> SCRATCH_;      // временные буферы forward (освобождаются после)
 
 static int64_t fsize(const std::string& p){ FILE* f=fopen(p.c_str(),"rb"); if(!f)return -1; fseek(f,0,SEEK_END); int64_t s=ftell(f); fclose(f); return s; }
@@ -478,10 +479,34 @@ static bool colFit(VkDeviceSize bytes){
     return bytes<=gColCap;  // если внезапно больше выделенного — caller сделает direct
 }
 struct ICp{uint32_t Cin,Hin,Win,KH,KW,pad,stride,Wout,colOff,chunkN;};
-// conv: 1×1 → matmul; K×K (любой stride) → im2col+matmul на нашем GEMM (с N-тайлингом если Col>лимита); иначе direct.
+// --- Winograd F(4×4,3×3): персистентные V/M-скретчи + кэш трансформ. весов U ---
+static Buf gWV, gWM; static VkDeviceSize gWVcap=0, gWMcap=0;
+static bool winoFit(VkDeviceSize needV, VkDeviceSize needM){
+    if (gWVcap==0){ VkDeviceSize cv=(VkDeviceSize)36*960*256*4; if(needV>cv)cv=needV; gWV=C_->alloc(cv,true); gWVcap=cv;
+        VkDeviceSize cm=(VkDeviceSize)36*640*256*4; if(needM>cm)cm=needM; gWM=C_->alloc(cm,true); gWMcap=cm; }
+    return needV<=gWVcap && needM<=gWMcap;
+}
+static Buf& Wwino(Buf& w, uint32_t OC, uint32_t IC){   // U=G w G^T, кэш по buf-хэндлу
+    uint64_t key=(uint64_t)w.buf; auto it=WCW_.find(key); if(it!=WCW_.end()) return it->second;
+    Buf u=C_->alloc((VkDeviceSize)36*OC*IC*4,true);
+    struct{uint32_t OC,IC;}p{OC,IC}; op(WIN_WT,{&w,&u},&p,8,(OC*IC+63)/64,1,1);
+    WCW_[key]=u; return WCW_[key];
+}
+// conv: 1×1 → matmul; 3×3 stride1 H≥32 → Winograd; иначе im2col+matmul (N-тайлинг); stride2 в т.ч.
 static void conv(Buf& x,Buf& w,Buf& y,uint32_t Ci,uint32_t Co,uint32_t H,uint32_t Wd,uint32_t K,uint32_t pad,uint32_t st){
     uint32_t Ho=(H+2*pad-K)/st+1, Wo=(Wd+2*pad-K)/st+1, Nout=Ho*Wo;
     if (st==1u && K==1u){ matmul(w,x,y,Co,H*Wd,Ci); return; }         // 1×1 conv = GEMM W[Co,Ci]·X[Ci,HW]
+    if (st==1u && K==3u && pad==1u && H>=32u && H==Wd && (H%4u)==0u){  // Winograd F(4,3) на высоком разрешении
+        uint32_t ntx=Wd/4u, nty=H/4u, nT=ntx*nty;
+        if (winoFit((VkDeviceSize)36*Ci*nT*4,(VkDeviceSize)36*Co*nT*4)){
+            Buf& u=Wwino(w,Co,Ci);
+            { struct{uint32_t IC,H,W,ntx,nty;}p{Ci,H,Wd,ntx,nty}; op(WIN_IN,{&x,&gWV},&p,20,(Ci*nT+63)/64,1,1); }
+            for (uint32_t xi=0;xi<36u;xi++){ uint32_t p[6]={Co,nT,Ci, xi*Co*Ci, xi*Ci*nT/4u, xi*Co*nT/4u};
+                op(MM_WINO,{&u,&gWV,&gWM},p,24,(nT+127)/128,(Co+127)/128,1); }
+            { struct{uint32_t OC,H,W,ntx,nty;}p{Co,H,Wd,ntx,nty}; op(WIN_OUT,{&gWM,&y},&p,20,(Co*nT+63)/64,1,1); }
+            return;
+        }
+    }
     uint32_t Kcol=Ci*K*K;
     if (colFit((VkDeviceSize)Kcol*Nout*4)){                           // целиком влезает: im2col + GEMM
         ICp p{Ci,H,Wd,K,K,pad,st,Wo,0u,Nout}; op(IM2COL,{&x,&gCol},&p,40,(Kcol*Nout+255)/256,1,1);
@@ -712,7 +737,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetProfile(JNIEnv*, jobject)
     gProfile=true;
     Buf noise=runGraph(lat,tp,ctx); (void)noise;
     gProfile=false;
-    const char* nm[NSH]={"GN","SILU","CONV","MM","AB","AB2","ADD","LN","SPLIT","ATTN","MERGE","GEGLU","T_CH","T_HC","UP","ATTN_BIG","IM2COL"};
+    const char* nm[NSH]={"GN","SILU","CONV","MM","AB","AB2","ADD","LN","SPLIT","ATTN","MERGE","GEGLU","T_CH","T_HC","UP","ATTN_BIG","IM2COL","WIN_IN","MM_WINO","WIN_OUT","WIN_WT"};
     double tot=0; for(int i=0;i<NSH;i++) tot+=gProfT[i];
     LOG("=== PROFILE forward total=%.1f ms ===", tot*1000.0);
     for(int i=0;i<NSH;i++) if(gProfN[i]>0)
@@ -740,6 +765,8 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetRelease(JNIEnv*, jobject)
     using namespace unet; if(!gInit) return;
     for (int i=0;i<NSH;i++) if(gKi[i]){ gK[i].destroy(gCtx); gKi[i]=false; }
     if (gColCap){ gCtx.free(gCol); gColCap=0; }
+    if (gWVcap){ gCtx.free(gWV); gWVcap=0; } if (gWMcap){ gCtx.free(gWM); gWMcap=0; }
+    for (auto& kv: WCW_) gCtx.free(kv.second); WCW_.clear();
     for (auto& kv: WC_) gCtx.free(kv.second); WC_.clear();
     gCtx.destroy(); gInit=false;
 }
