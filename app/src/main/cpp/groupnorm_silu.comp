@@ -1,0 +1,29 @@
+#version 450
+// Слитый GroupNorm + SiLU: y = silu(norm(x)). Экономит проход чтения+записи всего тензора.
+layout(local_size_x=256) in;
+layout(set=0,binding=0) readonly buffer BX { float X[]; };
+layout(set=0,binding=1) readonly buffer BG { float gamma[]; };
+layout(set=0,binding=2) readonly buffer BB { float beta[]; };
+layout(set=0,binding=3) writeonly buffer BY { float Y[]; };
+layout(push_constant) uniform P { uint C, HW, G; float eps; } p;
+shared float ssum[256];
+shared float ssq[256];
+void main(){
+    uint g=gl_WorkGroupID.x; uint tid=gl_LocalInvocationID.x;
+    uint cpg=p.C/p.G; uint groupSize=cpg*p.HW; uint c0=g*cpg;
+    float s=0.0, sq=0.0;
+    for (uint i=tid;i<groupSize;i+=256u){
+        uint ch=c0+i/p.HW; uint off=i%p.HW;
+        float v=X[ch*p.HW+off]; s+=v; sq+=v*v;
+    }
+    ssum[tid]=s; ssq[tid]=sq; barrier();
+    for (uint st=128u; st>0u; st>>=1u){ if(tid<st){ssum[tid]+=ssum[tid+st]; ssq[tid]+=ssq[tid+st];} barrier(); }
+    float mean=ssum[0]/float(groupSize);
+    float var=ssq[0]/float(groupSize)-mean*mean;
+    float inv=inversesqrt(var+p.eps);
+    for (uint i=tid;i<groupSize;i+=256u){
+        uint ch=c0+i/p.HW; uint off=i%p.HW;
+        float z=(X[ch*p.HW+off]-mean)*inv*gamma[ch]+beta[ch];
+        Y[ch*p.HW+off]=z/(1.0+exp(-z));   // SiLU
+    }
+}

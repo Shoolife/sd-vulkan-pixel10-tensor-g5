@@ -413,7 +413,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
 #include <cerrno>
 namespace unet {
 // шейдеры по индексу (порядок задаёт Kotlin)
-enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, IM2COL, WIN_IN, MM_WINO, WIN_OUT, WIN_WT, NSH };
+enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, IM2COL, WIN_IN, MM_WINO, WIN_OUT, WIN_WT, GN_SILU, NSH };
 static VkCtx* C_; static std::vector<std::vector<uint8_t>>* SH_; static std::string DIR_;
 static std::map<std::string,Buf> WC_;  // кэш весов (персистентный)
 static std::map<uint64_t,Buf> WCW_;    // кэш Winograd-трансформированных весов U (по buf-хэндлу)
@@ -472,6 +472,7 @@ struct ATp{uint32_t sQ,sK,d,H;float sc;}; struct N1p{uint32_t n;}; struct GGp{ui
 static void matmul(Buf& a,Buf& b,Buf& y,uint32_t M,uint32_t N,uint32_t K,uint32_t Nfull=0,uint32_t colOffV=0);  // forward
 static void silu(Buf& x,uint32_t n){ N1p p{n}; op(SILU,{&x,&x},&p,4,(n+255)/256,1,1); }
 static void groupnorm(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp p{Cc,HW,32,1e-5f}; op(GN,{&x,&g,&b,&y},&p,16,32,1,1); }
+static void groupnorm_silu(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp p{Cc,HW,32,1e-5f}; op(GN_SILU,{&x,&g,&b,&y},&p,16,32,1,1); }
 // переиспользуемый Col-буфер для im2col (один на весь forward, барьеры сериализуют доступ)
 static Buf gCol; static VkDeviceSize gColCap=0;
 static bool colFit(VkDeviceSize bytes){
@@ -537,13 +538,13 @@ static void stat(Buf& b, uint32_t n, const char* lbl){
 // ResNet-блок: x[Cin,H,W] + temb[1280] → out[Cout,H,W]
 static Buf resnet(const std::string& pf, Buf& x, Buf& temb, uint32_t Cin, uint32_t Cout, uint32_t H, uint32_t Wd){
     uint32_t HWi=H*Wd, Ni=Cin*HWi, No=Cout*HWi;
-    Buf h=mk((VkDeviceSize)Ni*4); groupnorm(x,W(pf+".norm1.weight"),W(pf+".norm1.bias"),h,Cin,HWi); silu(h,Ni);
+    Buf h=mk((VkDeviceSize)Ni*4); groupnorm_silu(x,W(pf+".norm1.weight"),W(pf+".norm1.bias"),h,Cin,HWi);
     Buf hc=mk((VkDeviceSize)No*4); conv(h,W(pf+".conv1.weight"),hc,Cin,Cout,H,Wd,3,1,1); addbias_c(hc,W(pf+".conv1.bias"),Cout,HWi);
     // time emb
     Buf ts=mk(1280*4); { N1p p{1280}; op(SILU,{&temb,&ts},&p,4,(1280+255)/256,1,1); }
     Buf tp=mk((VkDeviceSize)Cout*4); matmul(ts,W(pf+".time_emb_proj.weight"),tp,1,Cout,1280); addbias_l(tp,W(pf+".time_emb_proj.bias"),Cout,Cout);
     { ABp p{Cout,HWi}; op(AB,{&hc,&tp},&p,8,(No+255)/256,1,1); }   // hc += tp broadcast
-    Buf h2=mk((VkDeviceSize)No*4); groupnorm(hc,W(pf+".norm2.weight"),W(pf+".norm2.bias"),h2,Cout,HWi); silu(h2,No);
+    Buf h2=mk((VkDeviceSize)No*4); groupnorm_silu(hc,W(pf+".norm2.weight"),W(pf+".norm2.bias"),h2,Cout,HWi);
     Buf hc2=mk((VkDeviceSize)No*4); conv(h2,W(pf+".conv2.weight"),hc2,Cout,Cout,H,Wd,3,1,1); addbias_c(hc2,W(pf+".conv2.bias"),Cout,HWi);
     Buf out=mk((VkDeviceSize)No*4);
     if (Cin!=Cout){ Buf sx=mk((VkDeviceSize)No*4); conv(x,W(pf+".conv_shortcut.weight"),sx,Cin,Cout,H,Wd,1,0,1); addbias_c(sx,W(pf+".conv_shortcut.bias"),Cout,HWi); addv(sx,hc2,out,No); }
@@ -668,7 +669,7 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
     }
     LOG("GRAPH up done H=%d",H);
     // ---- OUT ---- groupnorm+silu+conv_out(320→4)
-    Buf gno=mk((VkDeviceSize)320*H*H*4); groupnorm(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H); silu(gno,320*H*H);
+    Buf gno=mk((VkDeviceSize)320*H*H*4); groupnorm_silu(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H);
     Buf y=mk((VkDeviceSize)4*H*H*4); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,H*H);
     if (!gProfile){  // один submit на весь forward
         vkEndCommandBuffer(gCmd);
@@ -736,7 +737,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetProfile(JNIEnv*, jobject)
     gProfile=true;
     Buf noise=runGraph(lat,tp,ctx); (void)noise;
     gProfile=false;
-    const char* nm[NSH]={"GN","SILU","CONV","MM","AB","AB2","ADD","LN","SPLIT","ATTN","MERGE","GEGLU","T_CH","T_HC","UP","ATTN_BIG","IM2COL","WIN_IN","MM_WINO","WIN_OUT","WIN_WT"};
+    const char* nm[NSH]={"GN","SILU","CONV","MM","AB","AB2","ADD","LN","SPLIT","ATTN","MERGE","GEGLU","T_CH","T_HC","UP","ATTN_BIG","IM2COL","WIN_IN","MM_WINO","WIN_OUT","WIN_WT","GN_SILU"};
     double tot=0; for(int i=0;i<NSH;i++) tot+=gProfT[i];
     LOG("=== PROFILE forward total=%.1f ms ===", tot*1000.0);
     for(int i=0;i<NSH;i++) if(gProfN[i]>0)
