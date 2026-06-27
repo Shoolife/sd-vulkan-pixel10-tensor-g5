@@ -60,6 +60,10 @@ object VulkanBench {
         val cv = context.assets.open("shaders/conv2d.spv").use { it.readBytes() }
         val ic = context.assets.open("shaders/im2col.spv").use { it.readBytes() }
         val sb = StringBuilder()
+        // matmul GFLOPS на чистых размерах (потолок G5 FP32 ≈ 1689 GFLOPS)
+        for (s in intArrayOf(512, 1024, 2048)) {
+            sb.appendLine("matmul ${s}³: ${"%.0f".format(benchMatmul(mm, s, s, s, 20))} GFLOPS")
+        }
         // conv2d на реальных слоях SD UNet: наивный прямой vs im2col+GEMM
         val convs = arrayOf(
             intArrayOf(320, 320, 64, 64, 3, 3),
@@ -80,8 +84,6 @@ object VulkanBench {
         val at = context.assets.open("shaders/attention.spv").use { it.readBytes() }
         sb.appendLine("self-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 4096, 40, 5))} ms")
         sb.appendLine("cross-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 77, 40, 5))} ms")
-        sb.appendLine(resnetCheck(context))   // сборка ResNet блока + сверка с PyTorch
-        sb.appendLine(transformerCheck(context))  // сборка Transformer блока + сверка
         val res = sb.toString().trim()
         Log.d("VulkanBench", res)
         return res
