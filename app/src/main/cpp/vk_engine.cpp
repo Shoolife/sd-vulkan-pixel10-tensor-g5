@@ -43,6 +43,34 @@ struct VkCtx {
             pr.limits.maxComputeSharedMemorySize/1024u, pr.limits.maxComputeWorkGroupInvocations,
             pr.limits.maxComputeWorkGroupSize[0],pr.limits.maxComputeWorkGroupSize[1],pr.limits.maxComputeWorkGroupSize[2],
             sg.subgroupSize, (uint32_t)(pr.limits.maxStorageBufferRange/1048576u), (unsigned long long)(vram/1048576ull));
+        // расширения: есть ли «тензорные ядра» (cooperative matrix) и т.п.
+        uint32_t nExt=0; vkEnumerateDeviceExtensionProperties(phys,nullptr,&nExt,nullptr);
+        std::vector<VkExtensionProperties> exts(nExt); vkEnumerateDeviceExtensionProperties(phys,nullptr,&nExt,exts.data());
+        auto hasExt=[&](const char* n){ for(auto&e:exts) if(strcmp(e.extensionName,n)==0) return 1; return 0; };
+        LOG("EXT(%u) coopmat_KHR=%d coopmat_NV=%d int_dot=%d fp16int8=%d 16bitstore=%d 8bitstore=%d subgroupExtTypes=%d",
+            nExt, hasExt("VK_KHR_cooperative_matrix"), hasExt("VK_NV_cooperative_matrix"),
+            hasExt("VK_KHR_shader_integer_dot_product"), hasExt("VK_KHR_shader_float16_int8"),
+            hasExt("VK_KHR_16bit_storage"), hasExt("VK_KHR_8bit_storage"),
+            hasExt("VK_KHR_shader_subgroup_extended_types"));
+        LOG("SUBGROUP ops=0x%x stages=0x%x (arith=%d shuffle=%d)", sg.supportedOperations, sg.supportedStages,
+            (sg.supportedOperations&VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)!=0,
+            (sg.supportedOperations&VK_SUBGROUP_FEATURE_SHUFFLE_BIT)!=0);
+#ifdef VK_KHR_cooperative_matrix
+        if (hasExt("VK_KHR_cooperative_matrix")){
+            auto pfn=(PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(inst,"vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+            if(pfn){ uint32_t nc=0; pfn(phys,&nc,nullptr);
+                std::vector<VkCooperativeMatrixPropertiesKHR> cps(nc);
+                for(auto&c:cps) c.sType=VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                pfn(phys,&nc,cps.data());
+                LOG("COOPMAT %u конфигов (типы: 0=fp16 1=fp32 ... scope3=subgroup):", nc);
+                for(uint32_t i=0;i<nc;i++){ auto&c=cps[i];
+                    LOG("  cfg%u M%u N%u K%u A=%u B=%u C=%u Res=%u sat=%d scope=%u",
+                        i,c.MSize,c.NSize,c.KSize,c.AType,c.BType,c.CType,c.ResultType,(int)c.saturatingAccumulation,c.scope); }
+            } else LOG("COOPMAT pfn=null");
+        }
+#else
+        LOG("COOPMAT: header нет VK_KHR_cooperative_matrix");
+#endif
         uint32_t nq=0; vkGetPhysicalDeviceQueueFamilyProperties(phys,&nq,nullptr);
         std::vector<VkQueueFamilyProperties> qf(nq); vkGetPhysicalDeviceQueueFamilyProperties(phys,&nq,qf.data());
         for (uint32_t i=0;i<nq;i++) if (qf[i].queueFlags&VK_QUEUE_COMPUTE_BIT){ qfi=i; break; }
