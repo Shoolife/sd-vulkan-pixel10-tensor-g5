@@ -11,6 +11,7 @@ object VulkanBench {
     external fun benchMatmulCoop(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
     external fun benchConv(spirv: ByteArray, cin: Int, cout: Int, h: Int, w: Int, kh: Int, kw: Int, iters: Int): Double
     external fun benchConvGemm(im2col: ByteArray, matmul: ByteArray, cin: Int, cout: Int, h: Int, w: Int, kh: Int, kw: Int, iters: Int): Double
+    external fun benchWinograd(winoIn: ByteArray, mmWino: ByteArray, winoOut: ByteArray, cin: Int, cout: Int, h: Int, w: Int, iters: Int): Double
     external fun benchSilu(spirv: ByteArray, n: Int, iters: Int): Double
     external fun benchGroupNorm(spirv: ByteArray, c: Int, hw: Int, g: Int, iters: Int): Double
     external fun benchAttention(spirv: ByteArray, h: Int, seqQ: Int, seqK: Int, d: Int, tq: Int, iters: Int): Double
@@ -79,11 +80,14 @@ object VulkanBench {
             intArrayOf(640, 640, 32, 32, 3, 3),
             intArrayOf(1280, 1280, 16, 16, 3, 3),
         )
-        sb.appendLine("conv GFLOPS [direct gemm]")
+        val wi = runCatching { context.assets.open("shaders/winograd_in.spv").use { it.readBytes() } }.getOrNull()
+        val wo = runCatching { context.assets.open("shaders/winograd_out.spv").use { it.readBytes() } }.getOrNull()
+        val wmm = runCatching { context.assets.open("shaders/matmul_wino.spv").use { it.readBytes() } }.getOrNull()
+        sb.appendLine("conv GFLOPS [gemm winograd]")
         for (c in convs) {
-            val dir = benchConv(cv, c[0], c[1], c[2], c[3], c[4], c[5], 10)
             val gemm = benchConvGemm(ic, mm, c[0], c[1], c[2], c[3], c[4], c[5], 10)
-            sb.appendLine("${c[0]}→${c[1]} ${c[2]}²: ${"%.0f".format(dir)} ${"%.0f".format(gemm)}")
+            val wino = if (wi != null && wo != null && wmm != null) benchWinograd(wi, wmm, wo, c[0], c[1], c[2], c[3], 10) else -9.0
+            sb.appendLine("${c[0]}→${c[1]} ${c[2]}²: ${"%.0f".format(gemm)} ${"%.0f".format(wino)}")
         }
         // простые ядра + groupnorm на размерах SD UNet
         val si = context.assets.open("shaders/silu.spv").use { it.readBytes() }

@@ -1,0 +1,37 @@
+#version 450
+// Winograd F(4x4,3x3) выходной трансформ: M[36, OC, nTiles] -> Y[OC,H,W].
+// Y_tile(4x4) = A^T m A,  m = 6x6. 1 поток = (oc,tile).
+layout(local_size_x = 64) in;
+layout(set=0,binding=0) readonly buffer BM { float M[]; };
+layout(set=0,binding=1) writeonly buffer BY { float Y[]; };
+layout(push_constant) uniform P { uint OC, H, W, nTilesX, nTilesY; } p;
+
+// A^T применённый к 6-вектору -> 4 выхода (строки A^T для F(4,3))
+void at(float v0,float v1,float v2,float v3,float v4,float v5, out float o[4]){
+    o[0] = v0 + v1 + v2 + v3 + v4;
+    o[1] = v1 - v2 + 2.0*v3 - 2.0*v4;
+    o[2] = v1 + v2 + 4.0*v3 + 4.0*v4;
+    o[3] = v1 - v2 + 8.0*v3 - 8.0*v4 + v5;
+}
+
+void main(){
+    uint gid = gl_GlobalInvocationID.x;
+    uint nTiles = p.nTilesX * p.nTilesY;
+    if (gid >= p.OC * nTiles) return;
+    uint oc = gid / nTiles, tile = gid % nTiles;
+    uint ty = tile / p.nTilesX, tx = tile % p.nTilesX;
+
+    float m[6][6];
+    for (int r=0;r<6;r++) for(int c=0;c<6;c++){ uint xi=uint(r)*6u+uint(c);
+        m[r][c] = M[(xi*p.OC + oc)*nTiles + tile]; }
+
+    // tmp = A^T · m  (4x6)
+    float tmp[4][6];
+    for (int c=0;c<6;c++){ float o[4]; at(m[0][c],m[1][c],m[2][c],m[3][c],m[4][c],m[5][c],o);
+        for(int r=0;r<4;r++) tmp[r][c]=o[r]; }
+    // Yt = tmp · (A^T)^T  (4x4)
+    uint yb = oc * p.H * p.W;
+    for (int r=0;r<4;r++){ float o[4]; at(tmp[r][0],tmp[r][1],tmp[r][2],tmp[r][3],tmp[r][4],tmp[r][5],o);
+        uint oy = ty*4u + uint(r); if (oy>=p.H) continue;
+        for(int c=0;c<4;c++){ uint ox=tx*4u+uint(c); if(ox<p.W) Y[yb + oy*p.W + ox]=o[c]; } }
+}

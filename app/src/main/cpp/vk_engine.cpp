@@ -830,6 +830,65 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runTransformerBlock(
     c.destroy(); return e;
 }
 
+// ====================== JNI: WINOGRAD F(4x4,3x3) conv ======================
+// 3 SPIR-V: winograd_in, matmul_wino, winograd_out. corr vs direct, GFLOPS по direct-FLOP.
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_benchWinograd(
+        JNIEnv* env, jobject, jbyteArray inSpv, jbyteArray mmSpv, jbyteArray outSpv,
+        jint Cin, jint Cout, jint H, jint W, jint iters) {
+    VkCtx c; if(!c.init()) return -1;
+    auto gs=[&](jbyteArray a){ jsize l=env->GetArrayLength(a); std::vector<uint8_t> v(l); env->GetByteArrayRegion(a,0,l,(jbyte*)v.data()); return v; };
+    auto si=gs(inSpv), sm=gs(mmSpv), so=gs(outSpv);
+    uint32_t ntx=(uint32_t)W/4u, nty=(uint32_t)H/4u, nT=ntx*nty;
+    // веса G g G^T на CPU
+    const float G[6][3]={{0.25f,0,0},{-1.f/6,-1.f/6,-1.f/6},{-1.f/6,1.f/6,-1.f/6},
+                         {1.f/24,1.f/12,1.f/6},{1.f/24,-1.f/12,1.f/6},{0,0,1.f}};
+    std::vector<float> hX((size_t)Cin*H*W), hW((size_t)Cout*Cin*9), U((size_t)36*Cout*Cin);
+    for(size_t i=0;i<hX.size();i++) hX[i]=(((i*131u+7u)%17u)*0.02f-0.16f);
+    for(size_t i=0;i<hW.size();i++) hW[i]=(((i*61u+13u)%19u)*0.02f-0.18f);
+    for(int oc=0;oc<Cout;oc++)for(int ic=0;ic<Cin;ic++){ const float* g=&hW[((size_t)oc*Cin+ic)*9];
+        float tmp[6][3]; for(int i=0;i<6;i++)for(int j=0;j<3;j++){float s=0;for(int k=0;k<3;k++)s+=G[i][k]*g[k*3+j];tmp[i][j]=s;}
+        for(int i=0;i<6;i++)for(int j=0;j<6;j++){float s=0;for(int k=0;k<3;k++)s+=tmp[i][k]*G[j][k];
+            U[((size_t)(i*6+j)*Cout+oc)*Cin+ic]=s; } }
+    VkDeviceSize szX=(VkDeviceSize)Cin*H*W*4, szU=(VkDeviceSize)36*Cout*Cin*4,
+        szV=(VkDeviceSize)36*Cin*nT*4, szM=(VkDeviceSize)36*Cout*nT*4, szY=(VkDeviceSize)Cout*H*W*4;
+    Buf bX=c.alloc(szX,true),bU=c.alloc(szU,true),bV=c.alloc(szV,true),bM=c.alloc(szM,true),bY=c.alloc(szY,true);
+    c.upload(bX,hX.data(),szX); c.upload(bU,U.data(),szU);
+
+    Kernel kin; kin.create(c,si.data(),si.size(),2,20); VkDescriptorSet din=kin.makeSet(c,{&bX,&bV});
+    Kernel kmm; kmm.create(c,sm.data(),sm.size(),3,24); VkDescriptorSet dmm=kmm.makeSet(c,{&bU,&bV,&bM});
+    Kernel kout; kout.create(c,so.data(),so.size(),2,20); VkDescriptorSet dout=kout.makeSet(c,{&bM,&bY});
+    uint32_t inPc[5]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,ntx,nty};
+    uint32_t outPc[5]={(uint32_t)Cout,(uint32_t)H,(uint32_t)W,ntx,nty};
+    auto barr=[&](VkCommandBuffer cmd){ VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); };
+    auto rec=[&](VkCommandBuffer cmd){
+        kin.record(cmd,din,inPc,(Cin*nT+63)/64,1,1); barr(cmd);
+        for(uint32_t xi=0;xi<36;xi++){ uint32_t pc[6]={(uint32_t)Cout,nT,(uint32_t)Cin,
+            xi*(uint32_t)Cout*(uint32_t)Cin, xi*(uint32_t)Cin*nT/4u, xi*(uint32_t)Cout*nT/4u};
+            kmm.record(cmd,dmm,pc,(nT+127)/128,((uint32_t)Cout+127)/128,1); }
+        barr(cmd);
+        kout.record(cmd,dout,outPc,((uint32_t)Cout*nT+63)/64,1,1); };
+    { VkCommandBuffer cmd=c.beginCmd(); rec(cmd); c.endCmd(cmd); }
+    // corr vs direct conv (CPU)
+    { std::vector<float> hY((size_t)Cout*H*W); c.download(bY,hY.data(),szY); double se=0,sr=0;
+      for(int s=0;s<12;s++){ int oc=(s*7+1)%Cout,oy=(s*13+2)%H,ox=(s*5+3)%W; float ref=0;
+        for(int ic=0;ic<Cin;ic++)for(int ky=0;ky<3;ky++)for(int kx=0;kx<3;kx++){int iy=oy+ky-1,ix=ox+kx-1;
+          if(iy<0||iy>=H||ix<0||ix>=W)continue; ref+=hX[((size_t)ic*H+iy)*W+ix]*hW[((size_t)oc*Cin+ic)*9+ky*3+kx];}
+        se+=fabsf(ref-hY[((size_t)oc*H+oy)*W+ox]); sr+=fabsf(ref); }
+      LOG("WINOGRAD Cin%d Cout%d %dx%d corr=%.4f %s",Cin,Cout,H,W,se/(sr+1e-6),se/(sr+1e-6)<0.02?"OK":"FAIL"); }
+    auto one=[&](){ VkCommandBuffer cmd=c.beginCmd(); rec(cmd); c.endCmd(cmd); };
+    one(); auto t0=std::chrono::high_resolution_clock::now();
+    for(int i=0;i<iters;i++) one();
+    auto t1=std::chrono::high_resolution_clock::now();
+    double sec=std::chrono::duration<double>(t1-t0).count()/iters;
+    double flops=2.0*(double)Cout*Cin*H*W*9;
+    LOG("winograd Cin%d Cout%d %dx%d: %.3f ms, %.1f GFLOPS",Cin,Cout,H,W,sec*1000,flops/sec/1e9);
+    kin.destroy(c);kmm.destroy(c);kout.destroy(c); c.free(bX);c.free(bU);c.free(bV);c.free(bM);c.free(bY); c.destroy();
+    return flops/sec/1e9;
+}
+
 // ====================== JNI: ATTENTION ======================
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_example_generet_1image_1ai_sd_VulkanBench_benchAttention(
