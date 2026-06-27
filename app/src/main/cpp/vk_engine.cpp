@@ -375,9 +375,17 @@ static void barrier(){
     vkCmdPipelineBarrier(gCmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&mb,0,nullptr,0,nullptr);
 }
+// профилировщик: каждая категория ops — суммарное GPU-время (standalone submit+waitIdle)
+static bool gProfile=false; static double gProfT[NSH]={0}; static int gProfN[NSH]={0};
 static void op(int si,std::vector<Buf*> bufs,const void* push,uint32_t pb,uint32_t gx,uint32_t gy,uint32_t gz){
     Kernel& k=kern(si,(int)bufs.size(),pb);
     VkDescriptorSet ds=k.makeSet(*C_,bufs);
+    if (gProfile){
+        VkCommandBuffer cmd=C_->beginCmd(); k.record(cmd,ds,push,gx,gy,gz);
+        auto t0=std::chrono::high_resolution_clock::now(); C_->endCmd(cmd);
+        auto t1=std::chrono::high_resolution_clock::now();
+        gProfT[si]+=std::chrono::duration<double>(t1-t0).count(); gProfN[si]++; return;
+    }
     k.record(gCmd,ds,push,gx,gy,gz); barrier();
 }
 struct GNp{uint32_t C,HW,G;float e;}; struct CVp{uint32_t Ci,Co,H,W,KH,KW,pad,st;};
@@ -390,21 +398,20 @@ static void groupnorm(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp 
 // переиспользуемый Col-буфер для im2col (один на весь forward, барьеры сериализуют доступ)
 static Buf gCol; static VkDeviceSize gColCap=0;
 static bool colFit(VkDeviceSize bytes){
-    if (gColCap==0){ VkDeviceSize cap=(VkDeviceSize)640*9*64*64*4; if(bytes>cap)cap=bytes; gCol=C_->alloc(cap,true); gColCap=cap; }
+    if (gColCap==0){ VkDeviceSize cap=(VkDeviceSize)832*9*64*64*4; if(bytes>cap)cap=bytes; gCol=C_->alloc(cap,true); gColCap=cap; }  // 832ch@64² ≈122МБ < лимит 128МБ
     return bytes<=gColCap;  // если внезапно больше выделенного — caller сделает direct
 }
-struct ICp{uint32_t Cin,H,W,KH,KW,pad,Ncol,Kcol;};
-// conv: 1×1 → matmul; K×K stride1 → im2col+matmul (на нашем быстром GEMM); stride>1 → direct.
+struct ICp{uint32_t Cin,Hin,Win,KH,KW,pad,stride,Wout;};
+// conv: 1×1 → matmul; K×K (любой stride) → im2col+matmul на нашем быстром GEMM; иначе direct.
 static void conv(Buf& x,Buf& w,Buf& y,uint32_t Ci,uint32_t Co,uint32_t H,uint32_t Wd,uint32_t K,uint32_t pad,uint32_t st){
-    uint32_t HW=H*Wd;
-    if (st==1u && K==1u){ matmul(w,x,y,Co,HW,Ci); return; }          // 1×1 conv = GEMM W[Co,Ci]·X[Ci,HW]
+    uint32_t Ho=(H+2*pad-K)/st+1, Wo=(Wd+2*pad-K)/st+1, Nout=Ho*Wo;
+    if (st==1u && K==1u){ matmul(w,x,y,Co,H*Wd,Ci); return; }         // 1×1 conv = GEMM W[Co,Ci]·X[Ci,HW]
     uint32_t Kcol=Ci*K*K;
-    if (st==1u && colFit((VkDeviceSize)Kcol*HW*4)){                   // K×K = im2col + GEMM
-        ICp p{Ci,H,Wd,K,K,pad,HW,Kcol}; op(IM2COL,{&x,&gCol},&p,32,(Kcol*HW+255)/256,1,1);
-        matmul(w,gCol,y,Co,HW,Kcol); return;
+    if (colFit((VkDeviceSize)Kcol*Nout*4)){                           // K×K (вкл. stride2) = im2col + GEMM
+        ICp p{Ci,H,Wd,K,K,pad,st,Wo}; op(IM2COL,{&x,&gCol},&p,32,(Kcol*Nout+255)/256,1,1);
+        matmul(w,gCol,y,Co,Nout,Kcol); return;
     }
-    CVp p{Ci,Co,H,Wd,K,K,pad,st}; uint32_t Ho=(H+2*pad-K)/st+1, Wo=(Wd+2*pad-K)/st+1;  // stride>1 → direct
-    op(CONV,{&x,&w,&y},&p,32,(Wo+15)/16,(Ho+15)/16,Co); }
+    CVp p{Ci,Co,H,Wd,K,K,pad,st}; op(CONV,{&x,&w,&y},&p,32,(Wo+15)/16,(Ho+15)/16,Co); }  // fallback direct
 static void addbias_c(Buf& y,Buf& b,uint32_t Cc,uint32_t HW){ ABp p{Cc,HW}; op(AB,{&y,&b},&p,8,(Cc*HW+255)/256,1,1); }
 static void addbias_l(Buf& y,Buf& b,uint32_t n,uint32_t Cc){ AB2p p{n,Cc}; op(AB2,{&y,&b},&p,8,(n+255)/256,1,1); }
 static void addv(Buf& a,Buf& b,Buf& y,uint32_t n){ N1p p{n}; op(ADD,{&a,&b,&y},&p,4,(n+255)/256,1,1); }
@@ -449,7 +456,7 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm1.weight"),&W(b+".norm1.bias"),&h},&p,12,HW,1,1); }
     matmul(h,W(b+".attn1.to_q.weight"),q,HW,Cc,Cc); matmul(h,W(b+".attn1.to_k.weight"),k,HW,Cc,Cc); matmul(h,W(b+".attn1.to_v.weight"),v,HW,Cc,Cc);
     split(q,qh,HW); split(k,kh,HW); split(v,vh,HW);
-    { ATp p{HW,HW,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&kh,&vh,&ah},&p,20,(HW+127)/128,nh,1);}else{op(ATTN_BIG,{&qh,&kh,&vh,&ah},&p,20,(HW+15)/16,nh,1);} }
+    { ATp p{HW,HW,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&kh,&vh,&ah},&p,20,(HW+127)/128,nh,1);}else{op(ATTN_BIG,{&qh,&kh,&vh,&ah},&p,20,(HW+127)/128,nh,1);} }
     merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*4); matmul(a,W(b+".attn1.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn1.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
     // cross-attn
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm2.weight"),&W(b+".norm2.bias"),&h},&p,12,HW,1,1); }
@@ -457,7 +464,7 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
     Buf kc=mk((VkDeviceSize)ctxN*Cc*4),vc=mk((VkDeviceSize)ctxN*Cc*4),khc=mk((VkDeviceSize)ctxN*Cc*4),vhc=mk((VkDeviceSize)ctxN*Cc*4);
     matmul(ctx,W(b+".attn2.to_k.weight"),kc,ctxN,Cc,768); matmul(ctx,W(b+".attn2.to_v.weight"),vc,ctxN,Cc,768);
     split(q,qh,HW); split(kc,khc,ctxN); split(vc,vhc,ctxN);
-    { ATp p{HW,ctxN,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&khc,&vhc,&ah},&p,20,(HW+127)/128,nh,1);}else{op(ATTN_BIG,{&qh,&khc,&vhc,&ah},&p,20,(HW+15)/16,nh,1);} }
+    { ATp p{HW,ctxN,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&khc,&vhc,&ah},&p,20,(HW+127)/128,nh,1);}else{op(ATTN_BIG,{&qh,&khc,&vhc,&ah},&p,20,(HW+127)/128,nh,1);} }
     merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*4); matmul(a,W(b+".attn2.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn2.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
     // ff GEGLU
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm3.weight"),&W(b+".norm3.bias"),&h},&p,12,HW,1,1); }
@@ -474,9 +481,12 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
 // concat по каналам: [Cp,HW] ++ [Cs,HW] → [(Cp+Cs),HW] (смежная память)
 static Buf concat(Buf& prev, uint32_t Cp, Buf& skip, uint32_t Cs, uint32_t HW){
     Buf out=mk((VkDeviceSize)(Cp+Cs)*HW*4);
+    VkBufferCopy c1{0,0,(VkDeviceSize)Cp*HW*4}, c2{0,(VkDeviceSize)Cp*HW*4,(VkDeviceSize)Cs*HW*4};
+    if (gProfile){ VkCommandBuffer cmd=C_->beginCmd(); vkCmdCopyBuffer(cmd,prev.buf,out.buf,1,&c1);
+        vkCmdCopyBuffer(cmd,skip.buf,out.buf,1,&c2); C_->endCmd(cmd); return out; }
     barrier();  // дождаться записи prev/skip перед копированием
-    VkBufferCopy c1{0,0,(VkDeviceSize)Cp*HW*4}; vkCmdCopyBuffer(gCmd,prev.buf,out.buf,1,&c1);
-    VkBufferCopy c2{0,(VkDeviceSize)Cp*HW*4,(VkDeviceSize)Cs*HW*4}; vkCmdCopyBuffer(gCmd,skip.buf,out.buf,1,&c2);
+    vkCmdCopyBuffer(gCmd,prev.buf,out.buf,1,&c1);
+    vkCmdCopyBuffer(gCmd,skip.buf,out.buf,1,&c2);
     barrier();  // копии видимы последующим шейдерам
     return out;
 }
@@ -501,7 +511,7 @@ static double corrCheck(Buf& got, const std::string& refName, uint32_t n){
 static void resetKernelPools(){ for(int i=0;i<NSH;i++) if(gKi[i]) gK[i].resetPool(*C_); }
 static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
     resetKernelPools();              // дескриптор-сеты прошлого forward освобождаем
-    gCmd=C_->beginCmd();             // один command buffer на весь граф
+    if(!gProfile) gCmd=C_->beginCmd();  // один command buffer на весь граф (в профиле — по-оп)
     // time embedding MLP
     Buf t1=mk(1280*4); matmul(tembp,W("time_embedding.linear_1.weight"),t1,1,1280,320); addbias_l(t1,W("time_embedding.linear_1.bias"),1280,1280); silu(t1,1280);
     Buf temb=mk(1280*4); matmul(t1,W("time_embedding.linear_2.weight"),temb,1,1280,1280); addbias_l(temb,W("time_embedding.linear_2.bias"),1280,1280);
@@ -550,11 +560,12 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
     // ---- OUT ---- groupnorm+silu+conv_out(320→4)
     Buf gno=mk((VkDeviceSize)320*H*H*4); groupnorm(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H); silu(gno,320*H*H);
     Buf y=mk((VkDeviceSize)4*H*H*4); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,H*H);
-    // один submit на весь forward
-    vkEndCommandBuffer(gCmd);
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&gCmd;
-    vkQueueSubmit(C_->queue,1,&si,VK_NULL_HANDLE); vkQueueWaitIdle(C_->queue);
-    vkFreeCommandBuffers(C_->dev,C_->pool,1,&gCmd); gCmd=VK_NULL_HANDLE;
+    if (!gProfile){  // один submit на весь forward
+        vkEndCommandBuffer(gCmd);
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&gCmd;
+        vkQueueSubmit(C_->queue,1,&si,VK_NULL_HANDLE); vkQueueWaitIdle(C_->queue);
+        vkFreeCommandBuffers(C_->dev,C_->pool,1,&gCmd); gCmd=VK_NULL_HANDLE;
+    }
     return y;
 }
 static VkCtx gCtx; static bool gInit=false;
@@ -600,6 +611,27 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetSelfTest(JNIEnv*, jobject
         LOG("UNET CTX-SENS |eps_cond-eps_unc|=%.4f (PyTorch=0.0295)",d);
     }
     return e;
+}
+
+// профиль: один forward по-операционно, лог GPU-времени по категориям
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_unetProfile(JNIEnv*, jobject) {
+    using namespace unet; if(!gInit) return;
+    auto loadF=[&](const std::string& nm, int n){ Buf b=mk((VkDeviceSize)n*4);
+        std::string p=DIR_+"/"+nm+".bin"; FILE* f=fopen(p.c_str(),"rb"); std::vector<__fp16> h(n);
+        if(f){ fread(h.data(),2,n,f); fclose(f); } std::vector<float> v(n); for(int i=0;i<n;i++) v[i]=(float)h[i];
+        gCtx.upload(b,v.data(),(VkDeviceSize)n*4); return b; };
+    for(int i=0;i<NSH;i++){ gProfT[i]=0; gProfN[i]=0; }
+    Buf lat=loadF("IN_lat",4*64*64), ctx=loadF("IN_ctx",77*768), tp=loadF("IN_temb_proj",320);
+    gProfile=true;
+    Buf noise=runGraph(lat,tp,ctx); (void)noise;
+    gProfile=false;
+    const char* nm[NSH]={"GN","SILU","CONV","MM","AB","AB2","ADD","LN","SPLIT","ATTN","MERGE","GEGLU","T_CH","T_HC","UP","ATTN_BIG","IM2COL"};
+    double tot=0; for(int i=0;i<NSH;i++) tot+=gProfT[i];
+    LOG("=== PROFILE forward total=%.1f ms ===", tot*1000.0);
+    for(int i=0;i<NSH;i++) if(gProfN[i]>0)
+        LOG("PROF %-8s %7.1f ms  (%4.1f%%)  n=%d", nm[i], gProfT[i]*1000.0, 100.0*gProfT[i]/tot, gProfN[i]);
+    for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();
 }
 
 // forward: latFp16[4*64*64*2], tembFp16[320*2], ctxFp16[77*768*2] → noiseFp16[4*64*64*2]
@@ -776,7 +808,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchConvGemm(
 
     Kernel ic; ic.create(c,icSpv.data(),icSpv.size(),2,32);
     VkDescriptorSet icDs=ic.makeSet(c,{&bX,&bCol});
-    uint32_t icPc[8]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,(uint32_t)KH,(uint32_t)KW,(uint32_t)pad,Ncol,Kcol};
+    uint32_t icPc[8]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,(uint32_t)KH,(uint32_t)KW,(uint32_t)pad,1u,(uint32_t)W};
     uint32_t icG=(Kcol*Ncol+255)/256;
 
     Kernel mm; mm.create(c,mmSpv.data(),mmSpv.size(),3,12);

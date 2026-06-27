@@ -19,6 +19,7 @@ object VulkanBench {
     external fun unetForward(lat: ByteArray, temb: ByteArray, ctx: ByteArray): ByteArray
     external fun unetRelease()
     external fun unetSelfTest(): Double
+    external fun unetProfile()
 
     fun unetShaders(ctx: Context): Array<ByteArray> {
         fun sh(n: String) = ctx.assets.open("shaders/$n.spv").use { it.readBytes() }
@@ -93,6 +94,13 @@ object VulkanBench {
         val at = context.assets.open("shaders/attention.spv").use { it.readBytes() }
         sb.appendLine("self-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 4096, 40, 128, 5))} ms")
         sb.appendLine("cross-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 77, 40, 128, 5))} ms")
+        // attention_big d80/d160: BT=16 vs TQ=128
+        val ab = context.assets.open("shaders/attention_big.spv").use { it.readBytes() }
+        val ab2 = runCatching { context.assets.open("shaders/attention_big2.spv").use { it.readBytes() } }.getOrNull()
+        sb.appendLine("big d80 s1024: v1=${"%.1f".format(benchAttention(ab, 8, 1024, 1024, 80, 16, 5))}" +
+            (if (ab2 != null) " v2=${"%.1f".format(benchAttention(ab2, 8, 1024, 1024, 80, 128, 5))}ms" else "ms"))
+        sb.appendLine("big d160 s256: v1=${"%.1f".format(benchAttention(ab, 8, 256, 256, 160, 16, 5))}" +
+            (if (ab2 != null) " v2=${"%.1f".format(benchAttention(ab2, 8, 256, 256, 160, 128, 5))}ms" else "ms"))
         val res = sb.toString().trim()
         Log.d("VulkanBench", res)
         return res

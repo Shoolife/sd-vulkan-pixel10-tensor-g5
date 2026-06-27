@@ -47,7 +47,14 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _state.update { it.copy(running = true, status = "Vulkan бенч…") }
             try {
-                val res = withContext(gpuDispatcher) { VulkanBench.run(app) }
+                val res = withContext(gpuDispatcher) {
+                    VulkanBench.unetInit(VulkanBench.unetShaders(app),
+                        java.io.File(app.getExternalFilesDir(null), "unet_w").absolutePath)
+                    val c = VulkanBench.unetSelfTest()
+                    VulkanBench.unetProfile()
+                    VulkanBench.unetRelease()
+                    "SELF-TEST relErr=${"%.4f".format(c)} (профиль в логах)\n" + VulkanBench.run(app)
+                }
                 _state.update { it.copy(running = false, status = res) }
             } catch (t: Throwable) {
                 android.util.Log.e("GenerateVM", "vk bench fail", t)
