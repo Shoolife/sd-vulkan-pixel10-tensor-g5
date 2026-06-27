@@ -25,7 +25,8 @@ object VulkanBench {
         // порядок = enum S в C++
         return arrayOf(sh("groupnorm"), sh("silu"), sh("conv2d"), sh("matmul"), sh("addbias"),
             sh("addbias2"), sh("add"), sh("layernorm"), sh("split_heads"), sh("attention"),
-            sh("merge_heads"), sh("geglu"), sh("t_chw2hwc"), sh("t_hwc2chw"), sh("upsample"), sh("attention_big"))
+            sh("merge_heads"), sh("geglu"), sh("t_chw2hwc"), sh("t_hwc2chw"), sh("upsample"), sh("attention_big"),
+            sh("im2col"))
     }
 
     fun transformerCheck(ctx: Context): String {
@@ -70,15 +71,17 @@ object VulkanBench {
         for (s in shapes) {
             sb.appendLine("mm ${s[0]}×${s[1]}×${s[2]}: ${"%.0f".format(benchMatmul(mm, s[0], s[1], s[2], 20))} GFLOPS")
         }
-        // conv2d на реальных слоях SD UNet: наивный прямой vs im2col+GEMM
+        // conv2d на реальных слоях SD UNet: direct (наивный, в движке) vs im2col+matmul
         val convs = arrayOf(
             intArrayOf(320, 320, 64, 64, 3, 3),
             intArrayOf(640, 640, 32, 32, 3, 3),
             intArrayOf(1280, 1280, 16, 16, 3, 3),
         )
+        sb.appendLine("conv GFLOPS [direct gemm]")
         for (c in convs) {
+            val dir = benchConv(cv, c[0], c[1], c[2], c[3], c[4], c[5], 10)
             val gemm = benchConvGemm(ic, mm, c[0], c[1], c[2], c[3], c[4], c[5], 10)
-            sb.appendLine("conv ${c[0]}→${c[1]} ${c[2]}²: ${"%.0f".format(gemm)} GFLOPS")
+            sb.appendLine("${c[0]}→${c[1]} ${c[2]}²: ${"%.0f".format(dir)} ${"%.0f".format(gemm)}")
         }
         // простые ядра + groupnorm на размерах SD UNet
         val si = context.assets.open("shaders/silu.spv").use { it.readBytes() }

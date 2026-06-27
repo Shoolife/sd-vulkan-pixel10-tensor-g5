@@ -30,7 +30,19 @@ struct VkCtx {
         uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,nullptr);
         std::vector<VkPhysicalDevice> ds(nd); vkEnumeratePhysicalDevices(inst,&nd,ds.data());
         phys=ds[0];
-        VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(phys,&pr); LOG("GPU: %s", pr.deviceName);
+        // subgroup (warp) свойства
+        VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 pr2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; pr2.pNext=&sg;
+        vkGetPhysicalDeviceProperties2(phys,&pr2);
+        VkPhysicalDeviceProperties& pr=pr2.properties; LOG("GPU: %s", pr.deviceName);
+        VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(phys,&mp);
+        VkDeviceSize vram=0; for(uint32_t i=0;i<mp.memoryHeapCount;i++) if(mp.memoryHeaps[i].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram+=mp.memoryHeaps[i].size;
+        LOG("HWCAPS api=%u.%u.%u vendor=0x%x device=0x%x | sharedMem=%uKB wgInvoc=%u wgSize=%ux%ux%u | subgroup=%u | maxAlloc=%uMB vram=%lluMB",
+            VK_VERSION_MAJOR(pr.apiVersion),VK_VERSION_MINOR(pr.apiVersion),VK_VERSION_PATCH(pr.apiVersion),
+            pr.vendorID, pr.deviceID,
+            pr.limits.maxComputeSharedMemorySize/1024u, pr.limits.maxComputeWorkGroupInvocations,
+            pr.limits.maxComputeWorkGroupSize[0],pr.limits.maxComputeWorkGroupSize[1],pr.limits.maxComputeWorkGroupSize[2],
+            sg.subgroupSize, (uint32_t)(pr.limits.maxStorageBufferRange/1048576u), (unsigned long long)(vram/1048576ull));
         uint32_t nq=0; vkGetPhysicalDeviceQueueFamilyProperties(phys,&nq,nullptr);
         std::vector<VkQueueFamilyProperties> qf(nq); vkGetPhysicalDeviceQueueFamilyProperties(phys,&nq,qf.data());
         for (uint32_t i=0;i<nq;i++) if (qf[i].queueFlags&VK_QUEUE_COMPUTE_BIT){ qfi=i; break; }
@@ -325,7 +337,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
 #include <cerrno>
 namespace unet {
 // шейдеры по индексу (порядок задаёт Kotlin)
-enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, NSH };
+enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, IM2COL, NSH };
 static VkCtx* C_; static std::vector<std::vector<uint8_t>>* SH_; static std::string DIR_;
 static std::map<std::string,Buf> WC_;  // кэш весов (персистентный)
 static std::vector<Buf> SCRATCH_;      // временные буферы forward (освобождаются после)
@@ -372,10 +384,26 @@ struct GNp{uint32_t C,HW,G;float e;}; struct CVp{uint32_t Ci,Co,H,W,KH,KW,pad,st
 struct ABp{uint32_t C,HW;}; struct AB2p{uint32_t n,C;}; struct T2p{uint32_t a,b;};
 struct LNp{uint32_t tok,C;float e;}; struct MMp{uint32_t M,N,K;}; struct SHp{uint32_t seq,nh,d;};
 struct ATp{uint32_t sQ,sK,d,H;float sc;}; struct N1p{uint32_t n;}; struct GGp{uint32_t tok,C2;};
+static void matmul(Buf& a,Buf& b,Buf& y,uint32_t M,uint32_t N,uint32_t K);  // forward
 static void silu(Buf& x,uint32_t n){ N1p p{n}; op(SILU,{&x,&x},&p,4,(n+255)/256,1,1); }
 static void groupnorm(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp p{Cc,HW,32,1e-5f}; op(GN,{&x,&g,&b,&y},&p,16,32,1,1); }
+// переиспользуемый Col-буфер для im2col (один на весь forward, барьеры сериализуют доступ)
+static Buf gCol; static VkDeviceSize gColCap=0;
+static bool colFit(VkDeviceSize bytes){
+    if (gColCap==0){ VkDeviceSize cap=(VkDeviceSize)640*9*64*64*4; if(bytes>cap)cap=bytes; gCol=C_->alloc(cap,true); gColCap=cap; }
+    return bytes<=gColCap;  // если внезапно больше выделенного — caller сделает direct
+}
+struct ICp{uint32_t Cin,H,W,KH,KW,pad,Ncol,Kcol;};
+// conv: 1×1 → matmul; K×K stride1 → im2col+matmul (на нашем быстром GEMM); stride>1 → direct.
 static void conv(Buf& x,Buf& w,Buf& y,uint32_t Ci,uint32_t Co,uint32_t H,uint32_t Wd,uint32_t K,uint32_t pad,uint32_t st){
-    CVp p{Ci,Co,H,Wd,K,K,pad,st}; uint32_t Ho=(H+2*pad-K)/st+1, Wo=(Wd+2*pad-K)/st+1;
+    uint32_t HW=H*Wd;
+    if (st==1u && K==1u){ matmul(w,x,y,Co,HW,Ci); return; }          // 1×1 conv = GEMM W[Co,Ci]·X[Ci,HW]
+    uint32_t Kcol=Ci*K*K;
+    if (st==1u && colFit((VkDeviceSize)Kcol*HW*4)){                   // K×K = im2col + GEMM
+        ICp p{Ci,H,Wd,K,K,pad,HW,Kcol}; op(IM2COL,{&x,&gCol},&p,32,(Kcol*HW+255)/256,1,1);
+        matmul(w,gCol,y,Co,HW,Kcol); return;
+    }
+    CVp p{Ci,Co,H,Wd,K,K,pad,st}; uint32_t Ho=(H+2*pad-K)/st+1, Wo=(Wd+2*pad-K)/st+1;  // stride>1 → direct
     op(CONV,{&x,&w,&y},&p,32,(Wo+15)/16,(Ho+15)/16,Co); }
 static void addbias_c(Buf& y,Buf& b,uint32_t Cc,uint32_t HW){ ABp p{Cc,HW}; op(AB,{&y,&b},&p,8,(Cc*HW+255)/256,1,1); }
 static void addbias_l(Buf& y,Buf& b,uint32_t n,uint32_t Cc){ AB2p p{n,Cc}; op(AB2,{&y,&b},&p,8,(n+255)/256,1,1); }
@@ -593,6 +621,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_example_generet_1image_1ai_sd_VulkanBench_unetRelease(JNIEnv*, jobject) {
     using namespace unet; if(!gInit) return;
     for (int i=0;i<NSH;i++) if(gKi[i]){ gK[i].destroy(gCtx); gKi[i]=false; }
+    if (gColCap){ gCtx.free(gCol); gColCap=0; }
     for (auto& kv: WC_) gCtx.free(kv.second); WC_.clear();
     gCtx.destroy(); gInit=false;
 }
@@ -737,12 +766,12 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchConvGemm(
     int pad=KH/2;
     uint32_t Ncol=(uint32_t)H*W, Kcol=(uint32_t)Cin*KH*KW, Mc=(uint32_t)Cout;
 
-    VkDeviceSize szX=(VkDeviceSize)Cin*H*W*2, szW=(VkDeviceSize)Cout*Kcol*2;
-    VkDeviceSize szCol=(VkDeviceSize)Kcol*Ncol*2, szY=(VkDeviceSize)Cout*Ncol*2;
+    VkDeviceSize szX=(VkDeviceSize)Cin*H*W*4, szW=(VkDeviceSize)Cout*Kcol*4;
+    VkDeviceSize szCol=(VkDeviceSize)Kcol*Ncol*4, szY=(VkDeviceSize)Cout*Ncol*4;
     Buf bX=c.alloc(szX,true), bW=c.alloc(szW,true), bCol=c.alloc(szCol,true), bY=c.alloc(szY,true);
-    std::vector<__fp16> hX((size_t)Cin*H*W), hW((size_t)Cout*Kcol);
-    for (size_t i=0;i<hX.size();i++) hX[i]=(__fp16)(((i*131u+7u)%17u)*0.02f-0.16f);
-    for (size_t i=0;i<hW.size();i++) hW[i]=(__fp16)(((i*61u+13u)%19u)*0.02f-0.18f);
+    std::vector<float> hX((size_t)Cin*H*W), hW((size_t)Cout*Kcol);
+    for (size_t i=0;i<hX.size();i++) hX[i]=(((i*131u+7u)%17u)*0.02f-0.16f);
+    for (size_t i=0;i<hW.size();i++) hW[i]=(((i*61u+13u)%19u)*0.02f-0.18f);
     c.upload(bX,hX.data(),szX); c.upload(bW,hW.data(),szW);
 
     Kernel ic; ic.create(c,icSpv.data(),icSpv.size(),2,32);
@@ -766,7 +795,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchConvGemm(
     auto one=[&](){ VkCommandBuffer cmd=c.beginCmd(); runConv(cmd); c.endCmd(cmd); };
     one(); // прогрев + для верификации
     // верификация Y vs CPU
-    { std::vector<__fp16> hY((size_t)Cout*Ncol); c.download(bY,hY.data(),szY);
+    { std::vector<float> hY((size_t)Cout*Ncol); c.download(bY,hY.data(),szY);
       double se=0,sr=0;
       for (int s=0;s<16;s++){ int co=(s*7+1)%Cout, oy=(s*13+2)%H, ox=(s*5+3)%W; float ref=0;
         for (int ci=0;ci<Cin;ci++) for(int ky=0;ky<KH;ky++) for(int kx=0;kx<KW;kx++){
@@ -796,11 +825,11 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchConv(
     env->GetByteArrayRegion(spirv,0,spvLen,(jbyte*)spv.data());
     int pad=KH/2;
 
-    VkDeviceSize szX=(VkDeviceSize)Cin*H*W*2, szW=(VkDeviceSize)Cout*Cin*KH*KW*2, szY=(VkDeviceSize)Cout*H*W*2;
+    VkDeviceSize szX=(VkDeviceSize)Cin*H*W*4, szW=(VkDeviceSize)Cout*Cin*KH*KW*4, szY=(VkDeviceSize)Cout*H*W*4;
     Buf bX=c.alloc(szX,true), bW=c.alloc(szW,true), bY=c.alloc(szY,true);
-    std::vector<__fp16> hX((size_t)Cin*H*W), hW((size_t)Cout*Cin*KH*KW);
-    for (size_t i=0;i<hX.size();i++) hX[i]=(__fp16)(((i*131u+7u)%17u)*0.02f-0.16f);
-    for (size_t i=0;i<hW.size();i++) hW[i]=(__fp16)(((i*61u+13u)%19u)*0.02f-0.18f);
+    std::vector<float> hX((size_t)Cin*H*W), hW((size_t)Cout*Cin*KH*KW);
+    for (size_t i=0;i<hX.size();i++) hX[i]=(((i*131u+7u)%17u)*0.02f-0.16f);
+    for (size_t i=0;i<hW.size();i++) hW[i]=(((i*61u+13u)%19u)*0.02f-0.18f);
     c.upload(bX,hX.data(),szX); c.upload(bW,hW.data(),szW);
 
     Kernel k; k.create(c,spv.data(),spvLen,3,32);  // push: Cin,Cout,H,W,KH,KW,pad,stride
@@ -809,7 +838,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchConv(
     uint32_t gx=((uint32_t)W+15)/16, gy=((uint32_t)H+15)/16, gz=(uint32_t)Cout;
 
     { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,pc,gx,gy,gz); c.endCmd(cmd); }
-    { std::vector<__fp16> hY((size_t)Cout*H*W); c.download(bY,hY.data(),szY);
+    { std::vector<float> hY((size_t)Cout*H*W); c.download(bY,hY.data(),szY);
       double se=0,sr=0;
       for (int s=0;s<16;s++){
           int co=(s*7+1)%Cout, oy=(s*13+2)%H, ox=(s*5+3)%W;
