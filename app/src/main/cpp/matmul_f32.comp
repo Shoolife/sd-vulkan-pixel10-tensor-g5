@@ -4,7 +4,7 @@
 // вместо 8 скалярных на каждый k. Цель: снять упор в bandwidth shared-памяти.
 #define BM 128
 #define BN 128
-#define BK 8
+#define BK 4
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0) readonly buffer BufA { float A[]; };
 layout(set = 0, binding = 1) readonly buffer BufB { vec4 B4[]; };

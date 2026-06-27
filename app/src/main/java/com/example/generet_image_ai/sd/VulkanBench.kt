@@ -61,8 +61,15 @@ object VulkanBench {
         val ic = context.assets.open("shaders/im2col.spv").use { it.readBytes() }
         val sb = StringBuilder()
         // matmul GFLOPS на чистых размерах (потолок G5 FP32 ≈ 1689 GFLOPS)
-        for (s in intArrayOf(512, 1024, 2048)) {
-            sb.appendLine("matmul ${s}³: ${"%.0f".format(benchMatmul(mm, s, s, s, 20))} GFLOPS")
+        // matmul (b4) на реальных формах движка + квадрат-пик
+        val shapes = arrayOf(
+            intArrayOf(4096, 2560, 320),  // ff-proj (самый тяжёлый)
+            intArrayOf(4096, 320, 320),   // q/k/v
+            intArrayOf(256, 1280, 1280),  // down2 q/k/v
+            intArrayOf(2048, 2048, 2048), // квадрат-пик
+        )
+        for (s in shapes) {
+            sb.appendLine("mm ${s[0]}×${s[1]}×${s[2]}: ${"%.0f".format(benchMatmul(mm, s[0], s[1], s[2], 20))} GFLOPS")
         }
         // conv2d на реальных слоях SD UNet: наивный прямой vs im2col+GEMM
         val convs = arrayOf(
