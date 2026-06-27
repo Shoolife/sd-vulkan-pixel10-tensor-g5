@@ -1,27 +1,29 @@
 #version 450
-// Flash-attention v2, vec4. Оптимизирован для d<=40 (главный боттлнек self-attn 64²).
-// q/acc компактные [MAXDD] vec4 (не [128]) → нет register spill. Векторный dot.
-#define BT 64
-#define MAXDD 10           // d/4, d<=40
-layout(local_size_x = BT) in;
+// Flash-attention v2, fp32, vec4. Развязаны размер блока запросов (TQ потоков = полный
+// subgroup 128 PowerVR) и размер K/V-тайла в shared (TK=64, чтобы влезть в 32КБ).
+// d<=40 (MAXDD=10). Цель: убрать 50%-простой лейнов при BT=64 на subgroup=128.
+#define TQ 128
+#define TK 64
+#define MAXDD 10
+layout(local_size_x = TQ) in;
 layout(set=0,binding=0) readonly buffer BQ { vec4 Q[]; };
 layout(set=0,binding=1) readonly buffer BK { vec4 K[]; };
 layout(set=0,binding=2) readonly buffer BV { vec4 V[]; };
 layout(set=0,binding=3) writeonly buffer BO { vec4 O[]; };
 layout(push_constant) uniform P { uint seqQ, seqK, d, H; float scale; } p;
 
-shared vec4 Ks[BT][MAXDD];
-shared vec4 Vs[BT][MAXDD];
+shared vec4 Ks[TK][MAXDD];
+shared vec4 Vs[TK][MAXDD];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint i = gl_WorkGroupID.x * BT + tid;
+    uint i = gl_WorkGroupID.x * TQ + tid;     // запрос
     uint h = gl_WorkGroupID.y;
-    uint dd = p.d >> 2;                 // векторов на строку
+    uint dd = p.d >> 2;
     bool inrange = (i < p.seqQ) && (h < p.H);
 
     vec4 q[MAXDD];
-    uint qv = (h*p.seqQ + i)*dd;        // в единицах vec4
+    uint qv = (h*p.seqQ + i)*dd;
     if (inrange) for (uint k=0u;k<dd;k++) q[k]=Q[qv+k];
 
     vec4 acc[MAXDD];
@@ -29,19 +31,22 @@ void main() {
     float m=-3.0e38, l=0.0;
     uint hkv = h*p.seqK*dd;
 
-    for (uint kb=0u; kb<p.seqK; kb+=BT) {
-        uint jg = kb + tid;
-        if (jg < p.seqK) for (uint k=0u;k<dd;k++){ Ks[tid][k]=K[hkv+jg*dd+k]; Vs[tid][k]=V[hkv+jg*dd+k]; }
+    for (uint kb=0u; kb<p.seqK; kb+=TK) {
+        // TQ потоков кооперативно грузят TK ключей/значений в shared
+        for (uint t=tid; t<TK; t+=TQ) {
+            uint jg = kb + t;
+            if (jg < p.seqK) for (uint k=0u;k<dd;k++){ Ks[t][k]=K[hkv+jg*dd+k]; Vs[t][k]=V[hkv+jg*dd+k]; }
+        }
         barrier();
         if (inrange) {
-            uint cnt = min(uint(BT), p.seqK-kb);
+            uint cnt = min(uint(TK), p.seqK-kb);
             for (uint jj=0u; jj<cnt; jj++) {
                 float s=0.0;
-                for (uint k=0u;k<dd;k++) s += dot(vec4(q[k]), vec4(Ks[jj][k]));
+                for (uint k=0u;k<dd;k++) s += dot(q[k], Ks[jj][k]);
                 s *= p.scale;
                 float mnew=max(m,s); float corr=exp(m-mnew); float pj=exp(s-mnew);
                 l = l*corr + pj;
-                for (uint k=0u;k<dd;k++) acc[k]=acc[k]*corr + pj*vec4(Vs[jj][k]);
+                for (uint k=0u;k<dd;k++) acc[k]=acc[k]*corr + pj*Vs[jj][k];
                 m=mnew;
             }
         }
@@ -49,6 +54,6 @@ void main() {
     }
     if (inrange) {
         uint ov=(h*p.seqQ+i)*dd; float invl=1.0/l;
-        for (uint k=0u;k<dd;k++) O[ov+k]=vec4(acc[k]*invl);
+        for (uint k=0u;k<dd;k++) O[ov+k]=acc[k]*invl;
     }
 }

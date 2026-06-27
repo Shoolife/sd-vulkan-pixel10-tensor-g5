@@ -449,7 +449,7 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm1.weight"),&W(b+".norm1.bias"),&h},&p,12,HW,1,1); }
     matmul(h,W(b+".attn1.to_q.weight"),q,HW,Cc,Cc); matmul(h,W(b+".attn1.to_k.weight"),k,HW,Cc,Cc); matmul(h,W(b+".attn1.to_v.weight"),v,HW,Cc,Cc);
     split(q,qh,HW); split(k,kh,HW); split(v,vh,HW);
-    { ATp p{HW,HW,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&kh,&vh,&ah},&p,20,(HW+63)/64,nh,1);}else{op(ATTN_BIG,{&qh,&kh,&vh,&ah},&p,20,(HW+15)/16,nh,1);} }
+    { ATp p{HW,HW,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&kh,&vh,&ah},&p,20,(HW+127)/128,nh,1);}else{op(ATTN_BIG,{&qh,&kh,&vh,&ah},&p,20,(HW+15)/16,nh,1);} }
     merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*4); matmul(a,W(b+".attn1.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn1.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
     // cross-attn
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm2.weight"),&W(b+".norm2.bias"),&h},&p,12,HW,1,1); }
@@ -457,7 +457,7 @@ static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uin
     Buf kc=mk((VkDeviceSize)ctxN*Cc*4),vc=mk((VkDeviceSize)ctxN*Cc*4),khc=mk((VkDeviceSize)ctxN*Cc*4),vhc=mk((VkDeviceSize)ctxN*Cc*4);
     matmul(ctx,W(b+".attn2.to_k.weight"),kc,ctxN,Cc,768); matmul(ctx,W(b+".attn2.to_v.weight"),vc,ctxN,Cc,768);
     split(q,qh,HW); split(kc,khc,ctxN); split(vc,vhc,ctxN);
-    { ATp p{HW,ctxN,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&khc,&vhc,&ah},&p,20,(HW+63)/64,nh,1);}else{op(ATTN_BIG,{&qh,&khc,&vhc,&ah},&p,20,(HW+15)/16,nh,1);} }
+    { ATp p{HW,ctxN,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&khc,&vhc,&ah},&p,20,(HW+127)/128,nh,1);}else{op(ATTN_BIG,{&qh,&khc,&vhc,&ah},&p,20,(HW+15)/16,nh,1);} }
     merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*4); matmul(a,W(b+".attn2.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn2.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
     // ff GEGLU
     { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm3.weight"),&W(b+".norm3.bias"),&h},&p,12,HW,1,1); }
@@ -715,25 +715,25 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runTransformerBlock(
 // ====================== JNI: ATTENTION ======================
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_example_generet_1image_1ai_sd_VulkanBench_benchAttention(
-        JNIEnv* env, jobject, jbyteArray spirv, jint H, jint seqQ, jint seqK, jint d, jint iters) {
+        JNIEnv* env, jobject, jbyteArray spirv, jint H, jint seqQ, jint seqK, jint d, jint tq, jint iters) {
     VkCtx c; if(!c.init()) return -1;
     jsize l=env->GetArrayLength(spirv); std::vector<uint8_t> spv(l); env->GetByteArrayRegion(spirv,0,l,(jbyte*)spv.data());
-    VkDeviceSize szQ=(VkDeviceSize)H*seqQ*d*2, szK=(VkDeviceSize)H*seqK*d*2, szO=szQ;
+    VkDeviceSize szQ=(VkDeviceSize)H*seqQ*d*4, szK=(VkDeviceSize)H*seqK*d*4, szO=szQ;
     Buf bQ=c.alloc(szQ,true), bK=c.alloc(szK,true), bV=c.alloc(szK,true), bO=c.alloc(szO,true);
-    std::vector<__fp16> hQ((size_t)H*seqQ*d), hK((size_t)H*seqK*d), hV((size_t)H*seqK*d);
-    for(size_t i=0;i<hQ.size();i++) hQ[i]=(__fp16)(((i*131u+7u)%23u)*0.05f-0.55f);
-    for(size_t i=0;i<hK.size();i++) hK[i]=(__fp16)(((i*61u+13u)%19u)*0.05f-0.45f);
-    for(size_t i=0;i<hV.size();i++) hV[i]=(__fp16)(((i*97u+5u)%17u)*0.05f-0.4f);
+    std::vector<float> hQ((size_t)H*seqQ*d), hK((size_t)H*seqK*d), hV((size_t)H*seqK*d);
+    for(size_t i=0;i<hQ.size();i++) hQ[i]=(((i*131u+7u)%23u)*0.05f-0.55f);
+    for(size_t i=0;i<hK.size();i++) hK[i]=(((i*61u+13u)%19u)*0.05f-0.45f);
+    for(size_t i=0;i<hV.size();i++) hV[i]=(((i*97u+5u)%17u)*0.05f-0.4f);
     c.upload(bQ,hQ.data(),szQ); c.upload(bK,hK.data(),szK); c.upload(bV,hV.data(),szK);
 
     Kernel k; k.create(c,spv.data(),spv.size(),4,20); VkDescriptorSet ds=k.makeSet(c,{&bQ,&bK,&bV,&bO});
     float scale=1.0f/sqrtf((float)d);
     struct { uint32_t sQ,sK,d,H; float sc; } pc{(uint32_t)seqQ,(uint32_t)seqK,(uint32_t)d,(uint32_t)H,scale};
-    uint32_t gx=((uint32_t)seqQ+63)/64, gy=(uint32_t)H;
+    uint32_t gx=((uint32_t)seqQ+(uint32_t)tq-1u)/(uint32_t)tq, gy=(uint32_t)H;
 
     { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,&pc,gx,gy,1); c.endCmd(cmd); }
     // верификация: эталонный softmax-attention на CPU для нескольких (h,i,k)
-    { std::vector<__fp16> hO((size_t)H*seqQ*d); c.download(bO,hO.data(),szO);
+    { std::vector<float> hO((size_t)H*seqQ*d); c.download(bO,hO.data(),szO);
       double se=0,sr=0;
       for (int t=0;t<8;t++){
           int h=(t)%H, i=(t*53+1)%seqQ, kk=(t*29+2)%d;
