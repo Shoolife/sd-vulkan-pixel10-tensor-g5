@@ -63,9 +63,8 @@ object VulkanBench {
         // matmul GFLOPS на чистых размерах (потолок G5 FP32 ≈ 1689 GFLOPS)
         // matmul (b4) на реальных формах движка + квадрат-пик
         val shapes = arrayOf(
-            intArrayOf(4096, 2560, 320),  // ff-proj (самый тяжёлый)
-            intArrayOf(4096, 320, 320),   // q/k/v
-            intArrayOf(256, 1280, 1280),  // down2 q/k/v
+            intArrayOf(4096, 2560, 320),  // ff-proj (самый тяжёлый слой)
+            intArrayOf(4096, 320, 1280),  // ff-out
             intArrayOf(2048, 2048, 2048), // квадрат-пик
         )
         for (s in shapes) {
