@@ -501,8 +501,7 @@ static void conv(Buf& x,Buf& w,Buf& y,uint32_t Ci,uint32_t Co,uint32_t H,uint32_
         if (winoFit((VkDeviceSize)36*Ci*nT*4,(VkDeviceSize)36*Co*nT*4)){
             Buf& u=Wwino(w,Co,Ci);
             { struct{uint32_t IC,H,W,ntx,nty;}p{Ci,H,Wd,ntx,nty}; op(WIN_IN,{&x,&gWV},&p,20,(Ci*nT+63)/64,1,1); }
-            for (uint32_t xi=0;xi<36u;xi++){ uint32_t p[6]={Co,nT,Ci, xi*Co*Ci, xi*Ci*nT/4u, xi*Co*nT/4u};
-                op(MM_WINO,{&u,&gWV,&gWM},p,24,(nT+127)/128,(Co+127)/128,1); }
+            { uint32_t p[3]={Co,nT,Ci}; op(MM_WINO,{&u,&gWV,&gWM},p,12,(nT+127)/128,(Co+127)/128,36); }  // 36 ξ через z-dim
             { struct{uint32_t OC,H,W,ntx,nty;}p{Co,H,Wd,ntx,nty}; op(WIN_OUT,{&gWM,&y},&p,20,(Co*nT+63)/64,1,1); }
             return;
         }
@@ -883,7 +882,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchWinograd(
     c.upload(bX,hX.data(),szX); c.upload(bU,U.data(),szU);
 
     Kernel kin; kin.create(c,si.data(),si.size(),2,20); VkDescriptorSet din=kin.makeSet(c,{&bX,&bV});
-    Kernel kmm; kmm.create(c,sm.data(),sm.size(),3,24); VkDescriptorSet dmm=kmm.makeSet(c,{&bU,&bV,&bM});
+    Kernel kmm; kmm.create(c,sm.data(),sm.size(),3,12); VkDescriptorSet dmm=kmm.makeSet(c,{&bU,&bV,&bM});
     Kernel kout; kout.create(c,so.data(),so.size(),2,20); VkDescriptorSet dout=kout.makeSet(c,{&bM,&bY});
     uint32_t inPc[5]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,ntx,nty};
     uint32_t outPc[5]={(uint32_t)Cout,(uint32_t)H,(uint32_t)W,ntx,nty};
@@ -892,9 +891,8 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchWinograd(
         vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); };
     auto rec=[&](VkCommandBuffer cmd){
         kin.record(cmd,din,inPc,(Cin*nT+63)/64,1,1); barr(cmd);
-        for(uint32_t xi=0;xi<36;xi++){ uint32_t pc[6]={(uint32_t)Cout,nT,(uint32_t)Cin,
-            xi*(uint32_t)Cout*(uint32_t)Cin, xi*(uint32_t)Cin*nT/4u, xi*(uint32_t)Cout*nT/4u};
-            kmm.record(cmd,dmm,pc,(nT+127)/128,((uint32_t)Cout+127)/128,1); }
+        { uint32_t pc[3]={(uint32_t)Cout,nT,(uint32_t)Cin};
+          kmm.record(cmd,dmm,pc,(nT+127)/128,((uint32_t)Cout+127)/128,36); }
         barr(cmd);
         kout.record(cmd,dout,outPc,((uint32_t)Cout*nT+63)/64,1,1); };
     { VkCommandBuffer cmd=c.beginCmd(); rec(cmd); c.endCmd(cmd); }
