@@ -22,6 +22,7 @@ struct VkCtx {
     uint32_t qfi=0;
     VkCommandPool pool=VK_NULL_HANDLE;
     bool fp16=false;
+    bool coopmat=false;
 
     bool init() {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion=VK_API_VERSION_1_1;
@@ -74,17 +75,29 @@ struct VkCtx {
         uint32_t nq=0; vkGetPhysicalDeviceQueueFamilyProperties(phys,&nq,nullptr);
         std::vector<VkQueueFamilyProperties> qf(nq); vkGetPhysicalDeviceQueueFamilyProperties(phys,&nq,qf.data());
         for (uint32_t i=0;i<nq;i++) if (qf[i].queueFlags&VK_QUEUE_COMPUTE_BIT){ qfi=i; break; }
-        // fp16 features
+        // fp16 + cooperative matrix features
         VkPhysicalDeviceShaderFloat16Int8Features f16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
         VkPhysicalDevice16BitStorageFeatures s16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES}; f16.pNext=&s16;
+        VkPhysicalDeviceVulkanMemoryModelFeatures vmm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES}; s16.pNext=&vmm;
+#ifdef VK_KHR_cooperative_matrix
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        bool hasCM = hasExt("VK_KHR_cooperative_matrix"); if (hasCM) vmm.pNext=&cmf;
+#endif
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2.pNext=&f16;
         vkGetPhysicalDeviceFeatures2(phys,&f2); fp16=f16.shaderFloat16 && s16.storageBuffer16BitAccess;
+        std::vector<const char*> devExt;
+#ifdef VK_KHR_cooperative_matrix
+        coopmat = hasCM && cmf.cooperativeMatrix && vmm.vulkanMemoryModel;
+        if (coopmat) devExt.push_back("VK_KHR_cooperative_matrix");
+#endif
         float prio=1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qci.queueFamilyIndex=qfi; qci.queueCount=1; qci.pQueuePriorities=&prio;
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         dci.queueCreateInfoCount=1; dci.pQueueCreateInfos=&qci; dci.pNext=&f2;
+        dci.enabledExtensionCount=(uint32_t)devExt.size(); dci.ppEnabledExtensionNames=devExt.data();
         if (vkCreateDevice(phys,&dci,nullptr,&dev)!=VK_SUCCESS) return false;
+        LOG("device coopmat=%d", (int)coopmat);
         vkGetDeviceQueue(dev,qfi,0,&queue);
         VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; cp.queueFamilyIndex=qfi;
@@ -238,6 +251,41 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmul(
     double sec=timeDispatch(c,k,ds,pc,gx,gy,1,iters);
     double g=2.0*(double)M*N*K/sec/1e9;
     LOG("matmul %dx%dx%d: %.3f ms, %.1f GFLOPS",M,N,K,sec*1000,g);
+    k.destroy(c); c.free(bA);c.free(bB);c.free(bC); c.destroy();
+    return g;
+}
+
+// ====================== JNI: MATMUL COOPERATIVE MATRIX (тензорные ядра) ======================
+// A[M,K] fp16, B[K,N] fp16, C[M,N] fp32. Требует M%16,N%64,K%16==0.
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmulCoop(
+        JNIEnv* env, jobject, jbyteArray spirv, jint M, jint N, jint K, jint iters) {
+    VkCtx c; if(!c.init()) return -1;
+    if(!c.coopmat){ c.destroy(); return -2; }
+    jsize spvLen=env->GetArrayLength(spirv); std::vector<uint8_t> spv(spvLen);
+    env->GetByteArrayRegion(spirv,0,spvLen,(jbyte*)spv.data());
+    VkDeviceSize szA=(VkDeviceSize)M*K*2, szB=(VkDeviceSize)K*N*2, szC=(VkDeviceSize)M*N*4;
+    Buf bA=c.alloc(szA,true), bB=c.alloc(szB,true), bC=c.alloc(szC,true);
+    std::vector<__fp16> hA((size_t)M*K), hB((size_t)K*N);
+    for (size_t i=0;i<hA.size();i++) hA[i]=(__fp16)(((i*131u+7u)%17u)*0.01f-0.08f);
+    for (size_t i=0;i<hB.size();i++) hB[i]=(__fp16)(((i*61u+13u)%19u)*0.01f-0.09f);
+    c.upload(bA,hA.data(),szA); c.upload(bB,hB.data(),szB);
+
+    Kernel k; k.create(c,spv.data(),spvLen,3,12);
+    VkDescriptorSet ds=k.makeSet(c,{&bA,&bB,&bC});
+    uint32_t pc[3]={(uint32_t)M,(uint32_t)N,(uint32_t)K};
+    uint32_t gx=((uint32_t)N+63)/64, gy=((uint32_t)M+15)/16;
+
+    { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,pc,gx,gy,1); c.endCmd(cmd); }
+    { std::vector<float> hC((size_t)M*N); c.download(bC,hC.data(),szC);
+      double se=0,sr=0; for(int s=0;s<16;s++){ int r=(s*97+3)%M,col=(s*53+11)%N; float ref=0;
+        for(int kk=0;kk<K;kk++) ref+=(float)hA[(size_t)r*K+kk]*(float)hB[(size_t)kk*N+col];
+        se+=fabsf(ref-hC[(size_t)r*N+col]); sr+=fabsf(ref);} double e=se/(sr+1e-6);
+      LOG("MMCOOP %dx%dx%d corr=%.4f %s",M,N,K,e,e<0.02?"OK":"FAIL"); }
+
+    double sec=timeDispatch(c,k,ds,pc,gx,gy,1,iters);
+    double g=2.0*(double)M*N*K/sec/1e9;
+    LOG("mmcoop %dx%dx%d: %.3f ms, %.1f GFLOPS",M,N,K,sec*1000,g);
     k.destroy(c); c.free(bA);c.free(bB);c.free(bC); c.destroy();
     return g;
 }

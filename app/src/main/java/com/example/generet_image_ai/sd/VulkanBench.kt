@@ -8,6 +8,7 @@ object VulkanBench {
     init { System.loadLibrary("vkbench") }
 
     external fun benchMatmul(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
+    external fun benchMatmulCoop(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
     external fun benchConv(spirv: ByteArray, cin: Int, cout: Int, h: Int, w: Int, kh: Int, kw: Int, iters: Int): Double
     external fun benchConvGemm(im2col: ByteArray, matmul: ByteArray, cin: Int, cout: Int, h: Int, w: Int, kh: Int, kw: Int, iters: Int): Double
     external fun benchSilu(spirv: ByteArray, n: Int, iters: Int): Double
