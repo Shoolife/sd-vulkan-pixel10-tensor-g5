@@ -9,7 +9,9 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0) readonly buffer BufA { float A[]; };
 layout(set = 0, binding = 1) readonly buffer BufB { vec4 B4[]; };
 layout(set = 0, binding = 2) writeonly buffer BufC { vec4 C4[]; };
-layout(push_constant) uniform Push { uint M, N, K; } p;
+// Nfull/colOffV: C — подматрица столбцов в выходе шириной Nfull (для N-тайлинга conv).
+// обычный matmul: Nfull=N, colOffV=0.
+layout(push_constant) uniform Push { uint M, N, K, Nfull, colOffV; } p;
 
 shared vec4 As[BK][BM/4];   // транспонированная A: As[k][r4] = строки r4*4..+3 на глубине k
 shared vec4 Bs[BK][BN/4];
@@ -54,8 +56,10 @@ void main() {
         barrier();
     }
     uint cv = blockCol/4u + tcv;
+    uint N4full = p.Nfull / 4u;
     for (uint i = 0u; i < 8u; i++) {
         uint gr = blockRow + tr4*4u + i;
-        if (gr < p.M){ if(cv<N4) C4[gr*N4 + cv]=acc0[i]; if(cv+1u<N4) C4[gr*N4 + cv+1u]=acc1[i]; }
+        if (gr < p.M){ uint base = gr*N4full + p.colOffV;
+            if(cv<N4) C4[base + cv]=acc0[i]; if(cv+1u<N4) C4[base + cv+1u]=acc1[i]; }
     }
 }

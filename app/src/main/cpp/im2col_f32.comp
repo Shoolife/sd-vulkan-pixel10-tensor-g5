@@ -4,16 +4,17 @@
 layout(local_size_x = 256) in;
 layout(set=0,binding=0) readonly buffer BX { float X[]; };
 layout(set=0,binding=1) writeonly buffer BC { float Col[]; };
-layout(push_constant) uniform P { uint Cin,Hin,Win,KH,KW,pad,stride,Wout; } p;
+// colOff/chunkN: пишем только столбцы [colOff, colOff+chunkN) в Col[k*chunkN + nlocal]
+// (для N-тайлинга больших conv). Обычно colOff=0, chunkN=Ncol(=Hout*Wout).
+layout(push_constant) uniform P { uint Cin,Hin,Win,KH,KW,pad,stride,Wout,colOff,chunkN; } p;
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    uint Hout = (p.Hin + 2u*p.pad - p.KH)/p.stride + 1u;
-    uint Ncol = Hout * p.Wout;
     uint Kcol = p.Cin * p.KH * p.KW;
-    if (idx >= Kcol*Ncol) return;
-    uint k = idx / Ncol;            // строка Col (ci,ky,kx)
-    uint n = idx % Ncol;            // столбец (oy,ox)
+    if (idx >= Kcol*p.chunkN) return;
+    uint k = idx / p.chunkN;            // строка Col (ci,ky,kx)
+    uint nl = idx % p.chunkN;           // локальный столбец
+    uint n = p.colOff + nl;             // глобальный (oy,ox)
     uint khkw = p.KH * p.KW;
     uint ci = k / khkw; uint rem = k % khkw;
     uint ky = rem / p.KW; uint kx = rem % p.KW;
@@ -23,5 +24,5 @@ void main() {
     float v = 0.0;
     if (iy>=0 && iy<int(p.Hin) && ix>=0 && ix<int(p.Win))
         v = X[ci*p.Hin*p.Win + uint(iy)*p.Win + uint(ix)];
-    Col[idx] = v;
+    Col[k*p.chunkN + nl] = v;
 }

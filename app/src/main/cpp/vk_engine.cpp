@@ -194,9 +194,9 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmul(
     for (size_t i=0;i<hB.size();i++) hB[i]=(((i*61u+13u)%19u)*0.01f-0.09f);
     c.upload(bA,hA.data(),szA); c.upload(bB,hB.data(),szB);
 
-    Kernel k; k.create(c,spv.data(),spvLen,3,12);
+    Kernel k; k.create(c,spv.data(),spvLen,3,20);
     VkDescriptorSet ds=k.makeSet(c,{&bA,&bB,&bC});
-    uint32_t pc[3]={(uint32_t)M,(uint32_t)N,(uint32_t)K};
+    uint32_t pc[5]={(uint32_t)M,(uint32_t)N,(uint32_t)K,(uint32_t)N,0u};
     uint32_t gx=((uint32_t)N+127)/128, gy=((uint32_t)M+127)/128;
 
     // прогрев + верификация (fp32)
@@ -390,9 +390,9 @@ static void op(int si,std::vector<Buf*> bufs,const void* push,uint32_t pb,uint32
 }
 struct GNp{uint32_t C,HW,G;float e;}; struct CVp{uint32_t Ci,Co,H,W,KH,KW,pad,st;};
 struct ABp{uint32_t C,HW;}; struct AB2p{uint32_t n,C;}; struct T2p{uint32_t a,b;};
-struct LNp{uint32_t tok,C;float e;}; struct MMp{uint32_t M,N,K;}; struct SHp{uint32_t seq,nh,d;};
+struct LNp{uint32_t tok,C;float e;}; struct MMp{uint32_t M,N,K,Nfull,colOffV;}; struct SHp{uint32_t seq,nh,d;};
 struct ATp{uint32_t sQ,sK,d,H;float sc;}; struct N1p{uint32_t n;}; struct GGp{uint32_t tok,C2;};
-static void matmul(Buf& a,Buf& b,Buf& y,uint32_t M,uint32_t N,uint32_t K);  // forward
+static void matmul(Buf& a,Buf& b,Buf& y,uint32_t M,uint32_t N,uint32_t K,uint32_t Nfull=0,uint32_t colOffV=0);  // forward
 static void silu(Buf& x,uint32_t n){ N1p p{n}; op(SILU,{&x,&x},&p,4,(n+255)/256,1,1); }
 static void groupnorm(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp p{Cc,HW,32,1e-5f}; op(GN,{&x,&g,&b,&y},&p,16,32,1,1); }
 // переиспользуемый Col-буфер для im2col (один на весь forward, барьеры сериализуют доступ)
@@ -401,21 +401,31 @@ static bool colFit(VkDeviceSize bytes){
     if (gColCap==0){ VkDeviceSize cap=(VkDeviceSize)832*9*64*64*4; if(bytes>cap)cap=bytes; gCol=C_->alloc(cap,true); gColCap=cap; }  // 832ch@64² ≈122МБ < лимит 128МБ
     return bytes<=gColCap;  // если внезапно больше выделенного — caller сделает direct
 }
-struct ICp{uint32_t Cin,Hin,Win,KH,KW,pad,stride,Wout;};
-// conv: 1×1 → matmul; K×K (любой stride) → im2col+matmul на нашем быстром GEMM; иначе direct.
+struct ICp{uint32_t Cin,Hin,Win,KH,KW,pad,stride,Wout,colOff,chunkN;};
+// conv: 1×1 → matmul; K×K (любой stride) → im2col+matmul на нашем GEMM (с N-тайлингом если Col>лимита); иначе direct.
 static void conv(Buf& x,Buf& w,Buf& y,uint32_t Ci,uint32_t Co,uint32_t H,uint32_t Wd,uint32_t K,uint32_t pad,uint32_t st){
     uint32_t Ho=(H+2*pad-K)/st+1, Wo=(Wd+2*pad-K)/st+1, Nout=Ho*Wo;
     if (st==1u && K==1u){ matmul(w,x,y,Co,H*Wd,Ci); return; }         // 1×1 conv = GEMM W[Co,Ci]·X[Ci,HW]
     uint32_t Kcol=Ci*K*K;
-    if (colFit((VkDeviceSize)Kcol*Nout*4)){                           // K×K (вкл. stride2) = im2col + GEMM
-        ICp p{Ci,H,Wd,K,K,pad,st,Wo}; op(IM2COL,{&x,&gCol},&p,32,(Kcol*Nout+255)/256,1,1);
+    if (colFit((VkDeviceSize)Kcol*Nout*4)){                           // целиком влезает: im2col + GEMM
+        ICp p{Ci,H,Wd,K,K,pad,st,Wo,0u,Nout}; op(IM2COL,{&x,&gCol},&p,40,(Kcol*Nout+255)/256,1,1);
         matmul(w,gCol,y,Co,Nout,Kcol); return;
+    }
+    uint32_t chunk=(uint32_t)((gColCap/4u)/(VkDeviceSize)Kcol) & ~3u;  // N-тайлинг (мульт. 4)
+    if (chunk>=4u){
+        for (uint32_t off=0; off<Nout; off+=chunk){
+            uint32_t cn=(off+chunk<=Nout)?chunk:(Nout-off);
+            ICp p{Ci,H,Wd,K,K,pad,st,Wo,off,cn}; op(IM2COL,{&x,&gCol},&p,40,(Kcol*cn+255)/256,1,1);
+            matmul(w,gCol,y,Co,cn,Kcol,Nout,off/4u);
+        }
+        return;
     }
     CVp p{Ci,Co,H,Wd,K,K,pad,st}; op(CONV,{&x,&w,&y},&p,32,(Wo+15)/16,(Ho+15)/16,Co); }  // fallback direct
 static void addbias_c(Buf& y,Buf& b,uint32_t Cc,uint32_t HW){ ABp p{Cc,HW}; op(AB,{&y,&b},&p,8,(Cc*HW+255)/256,1,1); }
 static void addbias_l(Buf& y,Buf& b,uint32_t n,uint32_t Cc){ AB2p p{n,Cc}; op(AB2,{&y,&b},&p,8,(n+255)/256,1,1); }
 static void addv(Buf& a,Buf& b,Buf& y,uint32_t n){ N1p p{n}; op(ADD,{&a,&b,&y},&p,4,(n+255)/256,1,1); }
-static void matmul(Buf& a,Buf& b,Buf& y,uint32_t M,uint32_t N,uint32_t K){ MMp p{M,N,K}; op(MM,{&a,&b,&y},&p,12,(N+127)/128,(M+127)/128,1); }
+static void matmul(Buf& a,Buf& b,Buf& y,uint32_t M,uint32_t N,uint32_t K,uint32_t Nfull,uint32_t colOffV){
+    if(Nfull==0u) Nfull=N; MMp p{M,N,K,Nfull,colOffV}; op(MM,{&a,&b,&y},&p,20,(N+127)/128,(M+127)/128,1); }
 
 static int gDbg=0;
 static void stat(Buf& b, uint32_t n, const char* lbl){
@@ -806,14 +816,14 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchConvGemm(
     for (size_t i=0;i<hW.size();i++) hW[i]=(((i*61u+13u)%19u)*0.02f-0.18f);
     c.upload(bX,hX.data(),szX); c.upload(bW,hW.data(),szW);
 
-    Kernel ic; ic.create(c,icSpv.data(),icSpv.size(),2,32);
+    Kernel ic; ic.create(c,icSpv.data(),icSpv.size(),2,40);
     VkDescriptorSet icDs=ic.makeSet(c,{&bX,&bCol});
-    uint32_t icPc[8]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,(uint32_t)KH,(uint32_t)KW,(uint32_t)pad,1u,(uint32_t)W};
+    uint32_t icPc[10]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,(uint32_t)KH,(uint32_t)KW,(uint32_t)pad,1u,(uint32_t)W,0u,Ncol};
     uint32_t icG=(Kcol*Ncol+255)/256;
 
-    Kernel mm; mm.create(c,mmSpv.data(),mmSpv.size(),3,12);
+    Kernel mm; mm.create(c,mmSpv.data(),mmSpv.size(),3,20);
     VkDescriptorSet mmDs=mm.makeSet(c,{&bW,&bCol,&bY});  // A=W[M,K], B=Col[K,N], C=Y[M,N]
-    uint32_t mmPc[3]={Mc,Ncol,Kcol};
+    uint32_t mmPc[5]={Mc,Ncol,Kcol,Ncol,0u};
     uint32_t gx=(Ncol+127)/128, gy=(Mc+127)/128;
 
     // один проход conv = im2col → matmul (с барьером между)
