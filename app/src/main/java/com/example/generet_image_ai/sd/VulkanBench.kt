@@ -19,7 +19,7 @@ object VulkanBench {
     external fun runResnetBlock(shaders: Array<ByteArray>, weights: Array<ByteArray>, c: Int, h: Int, w: Int, temb: Int): Double
     external fun runTransformerBlock(shaders: Array<ByteArray>, weights: Array<ByteArray>, c: Int, h: Int, w: Int, ctxN: Int, ctxD: Int, nh: Int): Double
     external fun unetInit(shaders: Array<ByteArray>, weightsDir: String): Int
-    external fun unetForward(lat: ByteArray, temb: ByteArray, ctx: ByteArray): ByteArray
+    external fun unetForward(lat: ByteArray, temb: ByteArray, ctx: ByteArray, mode: Int, slot: Int): ByteArray
     external fun unetRelease()
     external fun unetSelfTest(): Double
     external fun unetProfile()

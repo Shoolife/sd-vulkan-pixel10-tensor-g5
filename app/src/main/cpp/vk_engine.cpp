@@ -650,7 +650,10 @@ static double corrCheck(Buf& got, const std::string& refName, uint32_t n){
 // Полный UNet forward: lat[4,64,64], tembProj[320], ctx[77,768] → noise[4,64,64].
 // Использует persistent веса (WC_) и scratch (SCRATCH_).
 static void resetKernelPools(){ for(int i=0;i<NSH;i++) if(gKi[i]) gK[i].resetPool(*C_); }
-static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
+// DeepCache: кэш глубокой ветви (выход up[2] = вход up[3], 640@64²) на слот cond/uncond.
+static Buf gCache[2]; static VkDeviceSize gCacheCap=0;
+// mode: 0=full (считаем всё + сохраняем кэш), 1=cached (пропускаем deep, берём кэш). slot: 0=cond,1=uncond.
+static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
     resetKernelPools();              // дескриптор-сеты прошлого forward освобождаем
     if(!gProfile) gCmd=C_->beginCmd();  // один command buffer на весь граф (в профиле — по-оп)
     // time embedding MLP
@@ -660,44 +663,62 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx){
     Buf x=mk((VkDeviceSize)320*64*64*4); conv(lat,W("conv_in.weight"),x,4,320,64,64,3,1,1); addbias_c(x,W("conv_in.bias"),320,64*64);
     std::vector<Buf> skips; skips.push_back(x);
     uint32_t bo[4]={320,640,1280,1280};
-    // ---- DOWN ----
+    char pre[48];
+    // ---- DOWN[0] (всегда — даёт skip'ы для up[3]) ----
     uint32_t Cprev=320, H=64;
-    for (int i=0;i<4;i++){
-        uint32_t Cout=bo[i]; bool attn=(i<3);
-        char pre[48];
-        for (int r=0;r<2;r++){
-            snprintf(pre,48,"down_blocks.%d.resnets.%d",i,r);
-            Buf nx=resnet(pre,x,temb,(r==0)?Cprev:Cout,Cout,H,H); x=nx; Cprev=Cout;
-            if (attn){ snprintf(pre,48,"down_blocks.%d.attentions.%d",i,r); x=transformer(pre,x,ctx,Cout,H,H,8); }
-            skips.push_back(x);
-        }
-        if (i<3){ snprintf(pre,48,"down_blocks.%d.downsamplers.0",i); x=downsample(pre,x,Cout,H,H); H/=2; skips.push_back(x); }
+    for (int r=0;r<2;r++){
+        snprintf(pre,48,"down_blocks.0.resnets.%d",r); x=resnet(pre,x,temb,320,320,H,H); Cprev=320;
+        snprintf(pre,48,"down_blocks.0.attentions.%d",r); x=transformer(pre,x,ctx,320,H,H,8);
+        skips.push_back(x);
     }
-    LOG("GRAPH down done H=%d C=%d",H,Cprev);
-    // ---- MID ---- (1280, 8×8): resnet+transformer+resnet
-    x=resnet("mid_block.resnets.0",x,temb,1280,1280,H,H);
-    x=transformer("mid_block.attentions.0",x,ctx,1280,H,H,8);
-    x=resnet("mid_block.resnets.1",x,temb,1280,1280,H,H);
-    LOG("GRAPH mid done");
-    // ---- UP ---- up[i]: 3 resnet (cat skip), attn (кроме up0), upsample (кроме up3)
-    uint32_t upout[4]={1280,1280,640,320};
-    for (int i=0;i<4;i++){
-        uint32_t Cout=upout[i]; bool attn=(i>0); bool up=(i<3);
-        char pre[48];
-        for (int r=0;r<3;r++){
-            Buf skip=skips.back(); skips.pop_back();
-            uint32_t Cs=bo[3-i]; // каналы skip соответствуют уровню
-            // точные каналы skip берём из размера буфера
-            uint32_t Cskip=(uint32_t)(skip.size/4/((VkDeviceSize)H*H));  // fp32: 4 байта/элемент
-            uint32_t Cin=Cprev+Cskip;
-            Buf cc=concat(x,Cprev,skip,Cskip,H*H);
-            snprintf(pre,48,"up_blocks.%d.resnets.%d",i,r);
-            x=resnet(pre,cc,temb,Cin,Cout,H,H); Cprev=Cout;
-            if (attn){ snprintf(pre,48,"up_blocks.%d.attentions.%d",i,r); x=transformer(pre,x,ctx,Cout,H,H,8); }
+    if (mode==0){
+        x=downsample("down_blocks.0.downsamplers.0",x,320,H,H); H/=2; skips.push_back(x);
+        // ---- DOWN[1..3] ----
+        for (int i=1;i<4;i++){
+            uint32_t Cout=bo[i]; bool attn=(i<3);
+            for (int r=0;r<2;r++){
+                snprintf(pre,48,"down_blocks.%d.resnets.%d",i,r);
+                x=resnet(pre,x,temb,(r==0)?Cprev:Cout,Cout,H,H); Cprev=Cout;
+                if (attn){ snprintf(pre,48,"down_blocks.%d.attentions.%d",i,r); x=transformer(pre,x,ctx,Cout,H,H,8); }
+                skips.push_back(x);
+            }
+            if (i<3){ snprintf(pre,48,"down_blocks.%d.downsamplers.0",i); x=downsample(pre,x,Cout,H,H); H/=2; skips.push_back(x); }
         }
-        if (up){ snprintf(pre,48,"up_blocks.%d.upsamplers.0",i); x=upsample(pre,x,Cout,H,H); H*=2; }
+        // ---- MID ----
+        x=resnet("mid_block.resnets.0",x,temb,1280,1280,H,H);
+        x=transformer("mid_block.attentions.0",x,ctx,1280,H,H,8);
+        x=resnet("mid_block.resnets.1",x,temb,1280,1280,H,H);
+        // ---- UP[0..2] ----
+        uint32_t upout[4]={1280,1280,640,320};
+        for (int i=0;i<3;i++){
+            uint32_t Cout=upout[i];
+            for (int r=0;r<3;r++){
+                Buf skip=skips.back(); skips.pop_back();
+                uint32_t Cskip=(uint32_t)(skip.size/4/((VkDeviceSize)H*H));
+                Buf cc=concat(x,Cprev,skip,Cskip,H*H);
+                snprintf(pre,48,"up_blocks.%d.resnets.%d",i,r);
+                x=resnet(pre,cc,temb,Cprev+Cskip,Cout,H,H); Cprev=Cout;
+                if (i>0){ snprintf(pre,48,"up_blocks.%d.attentions.%d",i,r); x=transformer(pre,x,ctx,Cout,H,H,8); }
+            }
+            snprintf(pre,48,"up_blocks.%d.upsamplers.0",i); x=upsample(pre,x,Cout,H,H); H*=2;
+        }
+        // x теперь 640@64² (вход up[3]) — сохраняем в кэш слота
+        VkDeviceSize csz=(VkDeviceSize)640*64*64*4;
+        if (gCacheCap==0){ gCache[0]=C_->alloc(csz,true); gCache[1]=C_->alloc(csz,true); gCacheCap=csz; }
+        barrier(); VkBufferCopy cp{0,0,csz}; vkCmdCopyBuffer(gCmd,x.buf,gCache[slot].buf,1,&cp); barrier();
+    } else {
+        // cached: пропускаем deep, берём кэш как вход up[3]
+        x=gCache[slot]; Cprev=640; H=64;
     }
-    LOG("GRAPH up done H=%d",H);
+    // ---- UP[3] (всегда) ----
+    for (int r=0;r<3;r++){
+        Buf skip=skips.back(); skips.pop_back();
+        uint32_t Cskip=(uint32_t)(skip.size/4/((VkDeviceSize)H*H));
+        Buf cc=concat(x,Cprev,skip,Cskip,H*H);
+        snprintf(pre,48,"up_blocks.3.resnets.%d",r);
+        x=resnet(pre,cc,temb,Cprev+Cskip,320,H,H); Cprev=320;
+        snprintf(pre,48,"up_blocks.3.attentions.%d",r); x=transformer(pre,x,ctx,320,H,H,8);
+    }
     // ---- OUT ---- groupnorm+silu+conv_out(320→4)
     Buf gno=mk((VkDeviceSize)320*H*H*4); groupnorm_silu(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H);
     Buf y=mk((VkDeviceSize)4*H*H*4); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,H*H);
@@ -778,12 +799,12 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetProfile(JNIEnv*, jobject)
 // forward: latFp16[4*64*64*2], tembFp16[320*2], ctxFp16[77*768*2] → noiseFp16[4*64*64*2]
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_example_generet_1image_1ai_sd_VulkanBench_unetForward(
-        JNIEnv* env, jobject, jbyteArray latB, jbyteArray tembB, jbyteArray ctxB) {
+        JNIEnv* env, jobject, jbyteArray latB, jbyteArray tembB, jbyteArray ctxB, jint mode, jint slot) {
     using namespace unet; if(!gInit) return nullptr;
     auto up=[&](jbyteArray a, uint32_t n){ Buf b=mk((VkDeviceSize)n*4); jsize l=env->GetArrayLength(a);
         std::vector<uint8_t> v(l); env->GetByteArrayRegion(a,0,l,(jbyte*)v.data()); gCtx.upload(b,v.data(),v.size()); return b; };
     Buf lat=up(latB,4*64*64), temb=up(tembB,320), ctx=up(ctxB,77*768);
-    Buf noise=runGraph(lat,temb,ctx);
+    Buf noise=runGraph(lat,temb,ctx,mode,slot);
     std::vector<uint8_t> out((size_t)4*64*64*4); gCtx.download(noise,out.data(),out.size());
     jbyteArray res=env->NewByteArray((jsize)out.size()); env->SetByteArrayRegion(res,0,(jsize)out.size(),(jbyte*)out.data());
     for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();   // освобождаем временные, веса остаются
@@ -796,6 +817,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetRelease(JNIEnv*, jobject)
     for (int i=0;i<NSH;i++) if(gKi[i]){ gK[i].destroy(gCtx); gKi[i]=false; }
     if (gColCap){ gCtx.free(gCol); gColCap=0; }
     if (gWVcap){ gCtx.free(gWV); gWVcap=0; } if (gWMcap){ gCtx.free(gWM); gWMcap=0; }
+    if (gCacheCap){ gCtx.free(gCache[0]); gCtx.free(gCache[1]); gCacheCap=0; }
     for (auto& kv: WCW_) gCtx.free(kv.second); WCW_.clear();
     for (auto& kv: WC_) gCtx.free(kv.second); WC_.clear();
     gCtx.destroy(); gInit=false;
