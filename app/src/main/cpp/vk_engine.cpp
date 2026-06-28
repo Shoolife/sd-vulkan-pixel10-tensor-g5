@@ -395,8 +395,8 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchGroupNorm(
     for(size_t i=0;i<hX.size();i++) hX[i]=(__fp16)(((i*131u+7u)%29u)*0.1f-1.4f);
     for(int i=0;i<C;i++){ hG[i]=(__fp16)(0.8f+0.01f*(i%7)); hB[i]=(__fp16)(0.05f*(i%5)-0.1f); }
     c.upload(bX,hX.data(),szX); c.upload(bG,hG.data(),szP); c.upload(bB,hB.data(),szP);
-    Kernel k; k.create(c,spv.data(),spv.size(),4,16); VkDescriptorSet ds=k.makeSet(c,{&bX,&bG,&bB,&bY});
-    struct { uint32_t C,HW,G; float eps; } pc{(uint32_t)C,(uint32_t)HW,(uint32_t)G,1e-5f};
+    Kernel k; k.create(c,spv.data(),spv.size(),4,20); VkDescriptorSet ds=k.makeSet(c,{&bX,&bG,&bB,&bY});
+    struct { uint32_t C,HW,G,B; float eps; } pc{(uint32_t)C,(uint32_t)HW,(uint32_t)G,1u,1e-5f};
     uint32_t gx=(uint32_t)G;
     { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,&pc,gx,1,1); c.endCmd(cmd); }
     // верификация: пересчёт group-статистики на CPU
@@ -537,14 +537,15 @@ static void op(int si,std::vector<Buf*> bufs,const void* push,uint32_t pb,uint32
     }
     k.record(gCmd,ds,push,gx,gy,gz); barrier();
 }
-struct GNp{uint32_t C,HW,G;float e;}; struct CVp{uint32_t Ci,Co,H,W,KH,KW,pad,st;};
+struct GNp{uint32_t C,HW,G,B;float e;}; struct CVp{uint32_t Ci,Co,H,W,KH,KW,pad,st;};
+static int gB=1;   // батч текущего forward (CFG: 2 = cond+uncond вместе). Раскладка [C, B*HW]
 struct ABp{uint32_t C,HW;}; struct AB2p{uint32_t n,C;}; struct T2p{uint32_t a,b;};
 struct LNp{uint32_t tok,C;float e;}; struct MMp{uint32_t M,N,K,Nfull,colOffV;}; struct SHp{uint32_t seq,nh,d;};
 struct ATp{uint32_t sQ,sK,d,H;float sc;}; struct N1p{uint32_t n;}; struct GGp{uint32_t tok,C2;};
 static void matmul(Buf& a,Buf& b,Buf& y,uint32_t M,uint32_t N,uint32_t K,uint32_t Nfull=0,uint32_t colOffV=0);  // forward
 static void silu(Buf& x,uint32_t n){ N1p p{n}; op(SILU,{&x,&x},&p,4,(n+255)/256,1,1); }
-static void groupnorm(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp p{Cc,HW,32,1e-5f}; op(GN,{&x,&g,&b,&y},&p,16,32,1,1); }
-static void groupnorm_silu(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp p{Cc,HW,32,1e-5f}; op(GN_SILU,{&x,&g,&b,&y},&p,16,32,1,1); }
+static void groupnorm(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp p{Cc,HW,32,(uint32_t)gB,1e-5f}; op(GN,{&x,&g,&b,&y},&p,20,32u*(uint32_t)gB,1,1); }
+static void groupnorm_silu(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp p{Cc,HW,32,(uint32_t)gB,1e-5f}; op(GN_SILU,{&x,&g,&b,&y},&p,20,32u*(uint32_t)gB,1,1); }
 // переиспользуемый Col-буфер для im2col (один на весь forward, барьеры сериализуют доступ)
 static Buf gCol; static VkDeviceSize gColCap=0;
 static bool colFit(VkDeviceSize bytes){
