@@ -4,7 +4,8 @@
 layout(local_size_x = 64) in;
 layout(set=0,binding=0) readonly buffer BM { float M[]; };
 layout(set=0,binding=1) writeonly buffer BY { float Y[]; };
-layout(push_constant) uniform P { uint OC, H, W, nTilesX, nTilesY; } p;
+// outBase/outStride: выход — срез изображения b в [OC, B*H*W] (outBase=b*H*W, outStride=B*H*W)
+layout(push_constant) uniform P { uint OC, H, W, nTilesX, nTilesY, outBase, outStride; } p;
 
 // A^T применённый к 6-вектору -> 4 выхода (строки A^T для F(4,3))
 void at(float v0,float v1,float v2,float v3,float v4,float v5, out float o[4]){
@@ -30,7 +31,7 @@ void main(){
     for (int c=0;c<6;c++){ float o[4]; at(m[0][c],m[1][c],m[2][c],m[3][c],m[4][c],m[5][c],o);
         for(int r=0;r<4;r++) tmp[r][c]=o[r]; }
     // Yt = tmp · (A^T)^T  (4x4)
-    uint yb = oc * p.H * p.W;
+    uint yb = oc * p.outStride + p.outBase;
     for (int r=0;r<4;r++){ float o[4]; at(tmp[r][0],tmp[r][1],tmp[r][2],tmp[r][3],tmp[r][4],tmp[r][5],o);
         uint oy = ty*4u + uint(r); if (oy>=p.H) continue;
         for(int c=0;c<4;c++){ uint ox=tx*4u+uint(c); if(ox<p.W) Y[yb + oy*p.W + ox]=o[c]; } }

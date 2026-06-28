@@ -6,7 +6,9 @@ layout(set=0,binding=0) readonly buffer BX { float X[]; };
 layout(set=0,binding=1) writeonly buffer BC { float Col[]; };
 // colOff/chunkN: пишем только столбцы [colOff, colOff+chunkN) в Col[k*chunkN + nlocal]
 // (для N-тайлинга больших conv). Обычно colOff=0, chunkN=Ncol(=Hout*Wout).
-layout(push_constant) uniform P { uint Cin,Hin,Win,KH,KW,pad,stride,Wout,colOff,chunkN; } p;
+// imgBase/inStride: вход — срез изображения b в раскладке [Cin, B*Hin*Win]
+// (imgBase=b*Hin*Win, inStride=B*Hin*Win). batch=1 → imgBase=0, inStride=Hin*Win.
+layout(push_constant) uniform P { uint Cin,Hin,Win,KH,KW,pad,stride,Wout,colOff,chunkN,imgBase,inStride; } p;
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -23,6 +25,6 @@ void main() {
     int ix = int(ox*p.stride + kx) - int(p.pad);
     float v = 0.0;
     if (iy>=0 && iy<int(p.Hin) && ix>=0 && ix<int(p.Win))
-        v = X[ci*p.Hin*p.Win + uint(iy)*p.Win + uint(ix)];
+        v = X[ci*p.inStride + p.imgBase + uint(iy)*p.Win + uint(ix)];
     Col[k*p.chunkN + nl] = v;
 }

@@ -552,7 +552,7 @@ static bool colFit(VkDeviceSize bytes){
     if (gColCap==0){ VkDeviceSize cap=(VkDeviceSize)832*9*64*64*4; if(bytes>cap)cap=bytes; gCol=C_->alloc(cap,true); gColCap=cap; }  // 832ch@64² ≈122МБ < лимит 128МБ
     return bytes<=gColCap;  // если внезапно больше выделенного — caller сделает direct
 }
-struct ICp{uint32_t Cin,Hin,Win,KH,KW,pad,stride,Wout,colOff,chunkN;};
+struct ICp{uint32_t Cin,Hin,Win,KH,KW,pad,stride,Wout,colOff,chunkN,imgBase,inStride;};
 // --- Winograd F(4×4,3×3): персистентные V/M-скретчи + кэш трансформ. весов U ---
 static Buf gWV, gWM; static VkDeviceSize gWVcap=0, gWMcap=0;
 static bool winoFit(VkDeviceSize needV, VkDeviceSize needM){
@@ -572,39 +572,39 @@ static bool partFit(VkDeviceSize bytes){
     if (gPartCap==0){ VkDeviceSize cap=(VkDeviceSize)SPLITG*1280*256*4; if(bytes>cap)cap=bytes; gPart=C_->alloc(cap,true); gPartCap=cap; }
     return bytes<=gPartCap;
 }
-// conv: 1×1 → matmul; 3×3 stride1 H≥32 → Winograd; иначе im2col+matmul (split-K/N-тайлинг); stride2 в т.ч.
+// conv batch-aware (раскладка [C, B*HW]): 1×1 батчится (N=B*HW); 3×3/stride2 — per-image
+// цикл b (каждое изображение — одно-изображенческий путь со смещениями ввода/вывода).
 static void conv(Buf& x,Buf& w,Buf& y,uint32_t Ci,uint32_t Co,uint32_t H,uint32_t Wd,uint32_t K,uint32_t pad,uint32_t st){
     uint32_t Ho=(H+2*pad-K)/st+1, Wo=(Wd+2*pad-K)/st+1, Nout=Ho*Wo;
-    if (st==1u && K==1u){ matmul(w,x,y,Co,H*Wd,Ci); return; }         // 1×1 conv = GEMM W[Co,Ci]·X[Ci,HW]
-    if (st==1u && K==3u && pad==1u && H>=32u && H==Wd && (H%4u)==0u){  // Winograd F(4,3) на высоком разрешении
-        uint32_t ntx=Wd/4u, nty=H/4u, nT=ntx*nty;
-        if (winoFit((VkDeviceSize)36*Ci*nT*4,(VkDeviceSize)36*Co*nT*4)){
+    uint32_t HWin=H*Wd, B=(uint32_t)gB;
+    if (st==1u && K==1u){ matmul(w,x,y,Co,B*HWin,Ci); return; }       // 1×1 conv = GEMM, батчится (N=B*HW)
+    uint32_t Kcol=Ci*K*K, ntx=Wd/4u, nty=H/4u, nT=ntx*nty;
+    bool useWino = (st==1u && K==3u && pad==1u && H>=32u && H==Wd && (H%4u)==0u
+                    && winoFit((VkDeviceSize)36*Ci*nT*4,(VkDeviceSize)36*Co*nT*4));
+    for (uint32_t b=0; b<B; b++){
+        uint32_t inB=b*HWin, inS=B*HWin, outB=b*Nout, outNf=B*Nout;
+        if (useWino){
             Buf& u=Wwino(w,Co,Ci);
-            { struct{uint32_t IC,H,W,ntx,nty;}p{Ci,H,Wd,ntx,nty}; op(WIN_IN,{&x,&gWV},&p,20,(Ci*nT+63)/64,1,1); }
-            // 36 ξ через z-dim; на 32²/16² (nT<128) — BN=64 ядро (иначе половина N-тайла пустая)
+            { struct{uint32_t IC,H,W,ntx,nty,imgBase,inStride;}p{Ci,H,Wd,ntx,nty,inB,inS}; op(WIN_IN,{&x,&gWV},&p,28,(Ci*nT+63)/64,1,1); }
             if (nT>=128) { uint32_t p[3]={Co,nT,Ci}; op(MM_WINO,{&u,&gWV,&gWM},p,12,(nT+127)/128,(Co+127)/128,36); }
             else { uint32_t p[3]={Co,nT,Ci}; op(WIN_MM64,{&u,&gWV,&gWM},p,12,(nT+63)/64,(Co+127)/128,36); }
-            { struct{uint32_t OC,H,W,ntx,nty;}p{Co,H,Wd,ntx,nty}; op(WIN_OUT,{&gWM,&y},&p,20,(Co*nT+63)/64,1,1); }
-            return;
+            { struct{uint32_t OC,H,W,ntx,nty,outBase,outStride;}p{Co,H,Wd,ntx,nty,outB,outNf}; op(WIN_OUT,{&gWM,&y},&p,28,(Co*nT+63)/64,1,1); }
+            continue;
         }
-    }
-    uint32_t Kcol=Ci*K*K;
-    if (colFit((VkDeviceSize)Kcol*Nout*4)){                           // целиком влезает: im2col + GEMM
-        ICp p{Ci,H,Wd,K,K,pad,st,Wo,0u,Nout}; op(IM2COL,{&x,&gCol},&p,40,(Kcol*Nout+255)/256,1,1);
-        // split-K отключён: в изолированном бенче +15% на 16², но в движке overhead редукции
-        // + 4× трафик партиалов делает медленнее (46.5 vs 41.6с). Обычный matmul быстрее.
-        matmul(w,gCol,y,Co,Nout,Kcol); (void)partFit; return;
-    }
-    uint32_t chunk=(uint32_t)((gColCap/4u)/(VkDeviceSize)Kcol) & ~3u;  // N-тайлинг (мульт. 4)
-    if (chunk>=4u){
+        if (colFit((VkDeviceSize)Kcol*Nout*4)){                       // im2col + GEMM (одно изображение)
+            ICp p{Ci,H,Wd,K,K,pad,st,Wo,0u,Nout,inB,inS}; op(IM2COL,{&x,&gCol},&p,48,(Kcol*Nout+255)/256,1,1);
+            matmul(w,gCol,y,Co,Nout,Kcol, outNf, outB/4u);
+            continue;
+        }
+        uint32_t chunk=(uint32_t)((gColCap/4u)/(VkDeviceSize)Kcol) & ~3u;  // N-тайлинг внутри изображения
         for (uint32_t off=0; off<Nout; off+=chunk){
             uint32_t cn=(off+chunk<=Nout)?chunk:(Nout-off);
-            ICp p{Ci,H,Wd,K,K,pad,st,Wo,off,cn}; op(IM2COL,{&x,&gCol},&p,40,(Kcol*cn+255)/256,1,1);
-            matmul(w,gCol,y,Co,cn,Kcol,Nout,off/4u);
+            ICp p{Ci,H,Wd,K,K,pad,st,Wo,off,cn,inB,inS}; op(IM2COL,{&x,&gCol},&p,48,(Kcol*cn+255)/256,1,1);
+            matmul(w,gCol,y,Co,cn,Kcol, outNf, (outB+off)/4u);
         }
-        return;
     }
-    CVp p{Ci,Co,H,Wd,K,K,pad,st}; op(CONV,{&x,&w,&y},&p,32,(Wo+15)/16,(Ho+15)/16,Co); }  // fallback direct
+    (void)partFit;
+}
 static void addbias_c(Buf& y,Buf& b,uint32_t Cc,uint32_t HW){ ABp p{Cc,HW}; op(AB,{&y,&b},&p,8,(Cc*HW+255)/256,1,1); }
 static void addbias_l(Buf& y,Buf& b,uint32_t n,uint32_t Cc){ AB2p p{n,Cc}; op(AB2,{&y,&b},&p,8,(n+255)/256,1,1); }
 static void addv(Buf& a,Buf& b,Buf& y,uint32_t n){ N1p p{n}; op(ADD,{&a,&b,&y},&p,4,(n+255)/256,1,1); }
@@ -990,11 +990,11 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchWinograd(
     Buf bX=c.alloc(szX,true),bU=c.alloc(szU,true),bV=c.alloc(szV,true),bM=c.alloc(szM,true),bY=c.alloc(szY,true);
     c.upload(bX,hX.data(),szX); c.upload(bU,U.data(),szU);
 
-    Kernel kin; kin.create(c,si.data(),si.size(),2,20); VkDescriptorSet din=kin.makeSet(c,{&bX,&bV});
+    Kernel kin; kin.create(c,si.data(),si.size(),2,28); VkDescriptorSet din=kin.makeSet(c,{&bX,&bV});
     Kernel kmm; kmm.create(c,sm.data(),sm.size(),3,12); VkDescriptorSet dmm=kmm.makeSet(c,{&bU,&bV,&bM});
-    Kernel kout; kout.create(c,so.data(),so.size(),2,20); VkDescriptorSet dout=kout.makeSet(c,{&bM,&bY});
-    uint32_t inPc[5]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,ntx,nty};
-    uint32_t outPc[5]={(uint32_t)Cout,(uint32_t)H,(uint32_t)W,ntx,nty};
+    Kernel kout; kout.create(c,so.data(),so.size(),2,28); VkDescriptorSet dout=kout.makeSet(c,{&bM,&bY});
+    uint32_t inPc[7]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,ntx,nty,0u,(uint32_t)(H*W)};
+    uint32_t outPc[7]={(uint32_t)Cout,(uint32_t)H,(uint32_t)W,ntx,nty,0u,(uint32_t)(H*W)};
     auto barr=[&](VkCommandBuffer cmd){ VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); };
@@ -1085,9 +1085,9 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchConvGemm(
     for (size_t i=0;i<hW.size();i++) hW[i]=(((i*61u+13u)%19u)*0.02f-0.18f);
     c.upload(bX,hX.data(),szX); c.upload(bW,hW.data(),szW);
 
-    Kernel ic; ic.create(c,icSpv.data(),icSpv.size(),2,40);
+    Kernel ic; ic.create(c,icSpv.data(),icSpv.size(),2,48);
     VkDescriptorSet icDs=ic.makeSet(c,{&bX,&bCol});
-    uint32_t icPc[10]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,(uint32_t)KH,(uint32_t)KW,(uint32_t)pad,1u,(uint32_t)W,0u,Ncol};
+    uint32_t icPc[12]={(uint32_t)Cin,(uint32_t)H,(uint32_t)W,(uint32_t)KH,(uint32_t)KW,(uint32_t)pad,1u,(uint32_t)W,0u,Ncol,0u,(uint32_t)(H*W)};
     uint32_t icG=(Kcol*Ncol+255)/256;
 
     Kernel mm; mm.create(c,mmSpv.data(),mmSpv.size(),3,20);

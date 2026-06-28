@@ -4,7 +4,8 @@
 layout(local_size_x = 64) in;
 layout(set=0,binding=0) readonly buffer BX { float X[]; };
 layout(set=0,binding=1) writeonly buffer BV { float V[]; };
-layout(push_constant) uniform P { uint IC, H, W, nTilesX, nTilesY; } p;
+// imgBase/inStride: вход — срез изображения b в [IC, B*H*W] (imgBase=b*H*W, inStride=B*H*W)
+layout(push_constant) uniform P { uint IC, H, W, nTilesX, nTilesY, imgBase, inStride; } p;
 
 // B^T применённый к 6-вектору (строки матрицы B^T для F(4,3))
 void bt(float v0,float v1,float v2,float v3,float v4,float v5, out float o[6]){
@@ -23,7 +24,7 @@ void main(){
     uint ic = gid / nTiles, tile = gid % nTiles;
     uint ty = tile / p.nTilesX, tx = tile % p.nTilesX;
     int iy0 = int(ty)*4 - 1, ix0 = int(tx)*4 - 1;   // pad=1
-    uint xb = ic * p.H * p.W;
+    uint xb = ic * p.inStride + p.imgBase;
 
     float d[6][6];
     for (int r=0;r<6;r++){ int iy=iy0+r;
