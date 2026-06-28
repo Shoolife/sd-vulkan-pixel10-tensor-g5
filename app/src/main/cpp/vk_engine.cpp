@@ -702,10 +702,12 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
             }
             snprintf(pre,48,"up_blocks.%d.upsamplers.0",i); x=upsample(pre,x,Cout,H,H); H*=2;
         }
-        // x теперь 640@64² (вход up[3]) — сохраняем в кэш слота
-        VkDeviceSize csz=(VkDeviceSize)640*64*64*4;
-        if (gCacheCap==0){ gCache[0]=C_->alloc(csz,true); gCache[1]=C_->alloc(csz,true); gCacheCap=csz; }
-        barrier(); VkBufferCopy cp{0,0,csz}; vkCmdCopyBuffer(gCmd,x.buf,gCache[slot].buf,1,&cp); barrier();
+        // x теперь 640@64² (вход up[3]) — сохраняем в кэш слота (не в профиль-режиме: там gCmd=NULL)
+        if (!gProfile){
+            VkDeviceSize csz=(VkDeviceSize)640*64*64*4;
+            if (gCacheCap==0){ gCache[0]=C_->alloc(csz,true); gCache[1]=C_->alloc(csz,true); gCacheCap=csz; }
+            barrier(); VkBufferCopy cp{0,0,csz}; vkCmdCopyBuffer(gCmd,x.buf,gCache[slot].buf,1,&cp); barrier();
+        }
     } else {
         // cached: пропускаем deep, берём кэш как вход up[3]
         x=gCache[slot]; Cprev=640; H=64;
