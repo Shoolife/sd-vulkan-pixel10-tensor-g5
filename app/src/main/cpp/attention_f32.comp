@@ -3,7 +3,7 @@
 // acc*=corr делаем только когда max вырос (s>m); иначе пропускаем (corr=1). max
 // стабилизируется быстро → большинство ключей пропускают 10 vec4-умножений. + exp2 (нативный).
 #define TQ 128
-#define TK 64
+#define TK 32
 #define MAXDD 10
 layout(local_size_x = TQ) in;
 layout(set=0,binding=0) readonly buffer BQ { vec4 Q[]; };
