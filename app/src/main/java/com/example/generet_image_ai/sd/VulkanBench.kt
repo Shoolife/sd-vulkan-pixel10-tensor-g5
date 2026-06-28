@@ -97,10 +97,12 @@ object VulkanBench {
         sb.appendLine("silu 320×64²: ${"%.2f".format(benchSilu(si, 320 * 64 * 64, 30))} ms")
         sb.appendLine("groupnorm 320×64² g32: ${"%.2f".format(benchGroupNorm(gn, 320, 64 * 64, 32, 30))} ms")
         sb.appendLine("groupnorm 1280×16² g32: ${"%.2f".format(benchGroupNorm(gn, 1280, 16 * 16, 32, 30))} ms")
-        // attention движка (flash, TQ=128 = полный subgroup PowerVR)
+        // attention движка (flash, TQ=128) vs conditional-rescale вариант
         val at = context.assets.open("shaders/attention.spv").use { it.readBytes() }
-        sb.appendLine("self-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 4096, 40, 128, 5))} ms")
-        sb.appendLine("cross-attn 64² d40 h8: ${"%.1f".format(benchAttention(at, 8, 4096, 77, 40, 128, 5))} ms")
+        val atcr = runCatching { context.assets.open("shaders/attention_cr.spv").use { it.readBytes() } }.getOrNull()
+        sb.appendLine("self-attn 64²: base=${"%.1f".format(benchAttention(at, 8, 4096, 4096, 40, 128, 5))}" +
+            (if (atcr != null) " cr=${"%.1f".format(benchAttention(atcr, 8, 4096, 4096, 40, 128, 5))}ms" else "ms"))
+        sb.appendLine("cross-attn 64²: base=${"%.1f".format(benchAttention(at, 8, 4096, 77, 40, 128, 5))}ms")
         // attention_big d80/d160: BT=16 vs TQ=128
         val ab = context.assets.open("shaders/attention_big.spv").use { it.readBytes() }
         val ab2 = runCatching { context.assets.open("shaders/attention_big2.spv").use { it.readBytes() } }.getOrNull()

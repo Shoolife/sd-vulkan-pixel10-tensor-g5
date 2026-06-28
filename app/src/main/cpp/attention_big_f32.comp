@@ -18,15 +18,16 @@ void main(){
     vec4 q[MAXDD]; uint qv=(h*p.seqQ+i)*dd;
     if(inr) for(uint k=0u;k<dd;k++) q[k]=Q[qv+k];
     vec4 acc[MAXDD]; for(uint k=0u;k<dd;k++) acc[k]=vec4(0.0);
-    float m=-3.0e38,l=0.0; uint hkv=h*p.seqK*dd;
+    float m=-3.0e38,l=0.0; uint hkv=h*p.seqK*dd; const float L2E=1.442695041f;
     for(uint kb=0u;kb<p.seqK;kb+=TK){
         for(uint t=tid;t<TK;t+=TQ){ uint jg=kb+t;
             if(jg<p.seqK) for(uint k=0u;k<dd;k++){ Ks[t][k]=K[hkv+jg*dd+k]; Vs[t][k]=V[hkv+jg*dd+k]; } }
         barrier();
         if(inr){ uint cnt=min(uint(TK),p.seqK-kb);
             for(uint jj=0u;jj<cnt;jj++){ float s=0.0; for(uint k=0u;k<dd;k++) s+=dot(q[k],Ks[jj][k]); s*=p.scale;
-                float mn=max(m,s); float cr=exp(m-mn); float pj=exp(s-mn); l=l*cr+pj;
-                for(uint k=0u;k<dd;k++) acc[k]=acc[k]*cr+pj*Vs[jj][k]; m=mn; } }
+                if(s>m){ float cr=exp2((m-s)*L2E); l*=cr; for(uint k=0u;k<dd;k++) acc[k]*=cr; m=s; }
+                float pj=exp2((s-m)*L2E); l+=pj;
+                for(uint k=0u;k<dd;k++) acc[k]+=pj*Vs[jj][k]; } }
         barrier();
     }
     if(inr){ uint ov=(h*p.seqQ+i)*dd; float il=1.0/l; for(uint k=0u;k<dd;k++) O[ov+k]=acc[k]*il; }
