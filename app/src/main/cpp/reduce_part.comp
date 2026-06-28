@@ -1,0 +1,14 @@
+#version 450
+// Редукция split-K партиалов: Y[M,N] = sum_g Cpart[g, M, N]. 1 поток = 1 vec4 выхода.
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer BP { vec4 Cpart[]; };
+layout(set=0,binding=1) writeonly buffer BY { vec4 Y[]; };
+layout(push_constant) uniform P { uint M, N, G; } p;
+void main(){
+    uint idx = gl_GlobalInvocationID.x;
+    uint N4 = p.N/4u; uint total = p.M*N4;
+    if (idx >= total) return;
+    vec4 s = vec4(0.0);
+    for (uint g=0u; g<p.G; g++) s += Cpart[g*total + idx];
+    Y[idx] = s;
+}

@@ -285,6 +285,48 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmulTiled(
     return g;
 }
 
+// ====================== JNI: SPLIT-K matmul (большое K, малое N) ======================
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_benchSplitK(
+        JNIEnv* env, jobject, jbyteArray skSpv, jbyteArray redSpv, jint M, jint N, jint K, jint G, jint iters) {
+    VkCtx c; if(!c.init()) return -1;
+    auto gs=[&](jbyteArray a){ jsize l=env->GetArrayLength(a); std::vector<uint8_t> v(l); env->GetByteArrayRegion(a,0,l,(jbyte*)v.data()); return v; };
+    auto sk=gs(skSpv), rd=gs(redSpv);
+    VkDeviceSize szA=(VkDeviceSize)M*K*4, szB=(VkDeviceSize)K*N*4, szP=(VkDeviceSize)G*M*N*4, szY=(VkDeviceSize)M*N*4;
+    Buf bA=c.alloc(szA,true), bB=c.alloc(szB,true), bP=c.alloc(szP,true), bY=c.alloc(szY,true);
+    std::vector<float> hA((size_t)M*K), hB((size_t)K*N);
+    for (size_t i=0;i<hA.size();i++) hA[i]=(((i*131u+7u)%17u)*0.01f-0.08f);
+    for (size_t i=0;i<hB.size();i++) hB[i]=(((i*61u+13u)%19u)*0.01f-0.09f);
+    c.upload(bA,hA.data(),szA); c.upload(bB,hB.data(),szB);
+    Kernel ks; ks.create(c,sk.data(),sk.size(),3,16); VkDescriptorSet dks=ks.makeSet(c,{&bA,&bB,&bP});
+    Kernel kr; kr.create(c,rd.data(),rd.size(),2,12); VkDescriptorSet dkr=kr.makeSet(c,{&bP,&bY});
+    uint32_t Kchunk=((uint32_t)K+G-1)/G;
+    uint32_t skPc[4]={(uint32_t)M,(uint32_t)N,(uint32_t)K,Kchunk};
+    uint32_t rdPc[3]={(uint32_t)M,(uint32_t)N,(uint32_t)G};
+    uint32_t gx=((uint32_t)N+127)/128, gy=((uint32_t)M+127)/128;
+    uint32_t rg=((uint32_t)M*((uint32_t)N/4u)+255)/256;
+    auto rec=[&](VkCommandBuffer cmd){
+        ks.record(cmd,dks,skPc,gx,gy,(uint32_t)G);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER}; mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+        kr.record(cmd,dkr,rdPc,rg,1,1); };
+    { VkCommandBuffer cmd=c.beginCmd(); rec(cmd); c.endCmd(cmd); }
+    { std::vector<float> hY((size_t)M*N); c.download(bY,hY.data(),szY); double se=0,sr=0;
+      for(int s=0;s<16;s++){ int r=(s*97+3)%M,col=(s*53+11)%N; float ref=0;
+        for(int kk=0;kk<K;kk++) ref+=hA[(size_t)r*K+kk]*hB[(size_t)kk*N+col];
+        se+=fabsf(ref-hY[(size_t)r*N+col]); sr+=fabsf(ref);}
+      LOG("SPLITK %dx%dx%d G%d corr=%.4f %s",M,N,K,G,se/(sr+1e-6),se/(sr+1e-6)<0.02?"OK":"FAIL"); }
+    auto one=[&](){ VkCommandBuffer cmd=c.beginCmd(); rec(cmd); c.endCmd(cmd); };
+    one(); auto t0=std::chrono::high_resolution_clock::now();
+    for(int i=0;i<iters;i++) one();
+    auto t1=std::chrono::high_resolution_clock::now();
+    double sec=std::chrono::duration<double>(t1-t0).count()/iters;
+    double g=2.0*(double)M*N*K/sec/1e9;
+    LOG("splitk %dx%dx%d G%d: %.3f ms, %.1f GFLOPS",M,N,K,G,sec*1000,g);
+    ks.destroy(c);kr.destroy(c); c.free(bA);c.free(bB);c.free(bP);c.free(bY); c.destroy();
+    return g;
+}
+
 // ====================== JNI: MATMUL COOPERATIVE MATRIX (тензорные ядра) ======================
 // A[M,K] fp16, B[K,N] fp16, C[M,N] fp32. Требует M%16,N%64,K%16==0.
 extern "C" JNIEXPORT jdouble JNICALL
@@ -443,7 +485,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
 #include <cerrno>
 namespace unet {
 // шейдеры по индексу (порядок задаёт Kotlin)
-enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, IM2COL, WIN_IN, MM_WINO, WIN_OUT, WIN_WT, GN_SILU, WIN_MM64, NSH };
+enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, IM2COL, WIN_IN, MM_WINO, WIN_OUT, WIN_WT, GN_SILU, WIN_MM64, SPLITK, REDUCE, NSH };
 static VkCtx* C_; static std::vector<std::vector<uint8_t>>* SH_; static std::string DIR_;
 static std::map<std::string,Buf> WC_;  // кэш весов (персистентный)
 static std::map<uint64_t,Buf> WCW_;    // кэш Winograd-трансформированных весов U (по buf-хэндлу)
@@ -523,7 +565,13 @@ static Buf& Wwino(Buf& w, uint32_t OC, uint32_t IC){   // U=G w G^T, кэш по
     struct{uint32_t OC,IC;}p{OC,IC}; op(WIN_WT,{&w,&u},&p,8,(OC*IC+63)/64,1,1);
     WCW_[key]=u; return WCW_[key];
 }
-// conv: 1×1 → matmul; 3×3 stride1 H≥32 → Winograd; иначе im2col+matmul (N-тайлинг); stride2 в т.ч.
+// split-K партиалы (для «высоких-узких» conv: большое K, малое N): G частей, потом редукция
+static Buf gPart; static VkDeviceSize gPartCap=0; static const uint32_t SPLITG=4;
+static bool partFit(VkDeviceSize bytes){
+    if (gPartCap==0){ VkDeviceSize cap=(VkDeviceSize)SPLITG*1280*256*4; if(bytes>cap)cap=bytes; gPart=C_->alloc(cap,true); gPartCap=cap; }
+    return bytes<=gPartCap;
+}
+// conv: 1×1 → matmul; 3×3 stride1 H≥32 → Winograd; иначе im2col+matmul (split-K/N-тайлинг); stride2 в т.ч.
 static void conv(Buf& x,Buf& w,Buf& y,uint32_t Ci,uint32_t Co,uint32_t H,uint32_t Wd,uint32_t K,uint32_t pad,uint32_t st){
     uint32_t Ho=(H+2*pad-K)/st+1, Wo=(Wd+2*pad-K)/st+1, Nout=Ho*Wo;
     if (st==1u && K==1u){ matmul(w,x,y,Co,H*Wd,Ci); return; }         // 1×1 conv = GEMM W[Co,Ci]·X[Ci,HW]
@@ -542,7 +590,9 @@ static void conv(Buf& x,Buf& w,Buf& y,uint32_t Ci,uint32_t Co,uint32_t H,uint32_
     uint32_t Kcol=Ci*K*K;
     if (colFit((VkDeviceSize)Kcol*Nout*4)){                           // целиком влезает: im2col + GEMM
         ICp p{Ci,H,Wd,K,K,pad,st,Wo,0u,Nout}; op(IM2COL,{&x,&gCol},&p,40,(Kcol*Nout+255)/256,1,1);
-        matmul(w,gCol,y,Co,Nout,Kcol); return;
+        // split-K отключён: в изолированном бенче +15% на 16², но в движке overhead редукции
+        // + 4× трафик партиалов делает медленнее (46.5 vs 41.6с). Обычный matmul быстрее.
+        matmul(w,gCol,y,Co,Nout,Kcol); (void)partFit; return;
     }
     uint32_t chunk=(uint32_t)((gColCap/4u)/(VkDeviceSize)Kcol) & ~3u;  // N-тайлинг (мульт. 4)
     if (chunk>=4u){
@@ -792,7 +842,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetProfile(JNIEnv*, jobject)
     gProfile=true;
     Buf noise=runGraph(lat,tp,ctx); (void)noise;
     gProfile=false;
-    const char* nm[NSH]={"GN","SILU","CONV","MM","AB","AB2","ADD","LN","SPLIT","ATTN","MERGE","GEGLU","T_CH","T_HC","UP","ATTN_BIG","IM2COL","WIN_IN","MM_WINO","WIN_OUT","WIN_WT","GN_SILU","WIN_MM64"};
+    const char* nm[NSH]={"GN","SILU","CONV","MM","AB","AB2","ADD","LN","SPLIT","ATTN","MERGE","GEGLU","T_CH","T_HC","UP","ATTN_BIG","IM2COL","WIN_IN","MM_WINO","WIN_OUT","WIN_WT","GN_SILU","WIN_MM64","SPLITK","REDUCE"};
     double tot=0; for(int i=0;i<NSH;i++) tot+=gProfT[i];
     LOG("=== PROFILE forward total=%.1f ms ===", tot*1000.0);
     for(int i=0;i<NSH;i++) if(gProfN[i]>0)
@@ -822,6 +872,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetRelease(JNIEnv*, jobject)
     if (gColCap){ gCtx.free(gCol); gColCap=0; }
     if (gWVcap){ gCtx.free(gWV); gWVcap=0; } if (gWMcap){ gCtx.free(gWM); gWMcap=0; }
     if (gCacheCap){ gCtx.free(gCache[0]); gCtx.free(gCache[1]); gCacheCap=0; }
+    if (gPartCap){ gCtx.free(gPart); gPartCap=0; }
     for (auto& kv: WCW_) gCtx.free(kv.second); WCW_.clear();
     for (auto& kv: WC_) gCtx.free(kv.second); WC_.clear();
     gCtx.destroy(); gInit=false;

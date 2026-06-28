@@ -10,6 +10,7 @@ object VulkanBench {
     external fun benchMatmul(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
     external fun benchMatmulCoop(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
     external fun benchMatmulTiled(spirv: ByteArray, m: Int, n: Int, k: Int, bm: Int, bn: Int, iters: Int): Double
+    external fun benchSplitK(sk: ByteArray, red: ByteArray, m: Int, n: Int, k: Int, g: Int, iters: Int): Double
     external fun benchConv(spirv: ByteArray, cin: Int, cout: Int, h: Int, w: Int, kh: Int, kw: Int, iters: Int): Double
     external fun benchConvGemm(im2col: ByteArray, matmul: ByteArray, cin: Int, cout: Int, h: Int, w: Int, kh: Int, kw: Int, iters: Int): Double
     external fun benchWinograd(winoIn: ByteArray, mmWino: ByteArray, winoOut: ByteArray, cin: Int, cout: Int, h: Int, w: Int, iters: Int): Double
@@ -31,7 +32,7 @@ object VulkanBench {
             sh("addbias2"), sh("add"), sh("layernorm"), sh("split_heads"), sh("attention"),
             sh("merge_heads"), sh("geglu"), sh("t_chw2hwc"), sh("t_hwc2chw"), sh("upsample"), sh("attention_big"),
             sh("im2col"), sh("winograd_in"), sh("matmul_wino"), sh("winograd_out"), sh("winograd_wt"),
-            sh("groupnorm_silu"), sh("matmul_wino64"))
+            sh("groupnorm_silu"), sh("matmul_wino64"), sh("matmul_splitk"), sh("reduce_part"))
     }
 
     fun transformerCheck(ctx: Context): String {
@@ -75,6 +76,16 @@ object VulkanBench {
         )
         for (s in shapes) {
             sb.appendLine("mm ${s[0]}×${s[1]}×${s[2]}: ${"%.0f".format(benchMatmul(mm, s[0], s[1], s[2], 20))} GFLOPS")
+        }
+        // split-K на формах низкоразрешённых conv (M=Cout, N=nTiles, K=Cin*9): regular vs G=4
+        val sk = runCatching { context.assets.open("shaders/matmul_splitk.spv").use { it.readBytes() } }.getOrNull()
+        val red = runCatching { context.assets.open("shaders/reduce_part.spv").use { it.readBytes() } }.getOrNull()
+        if (sk != null && red != null) {
+            for (s in arrayOf(intArrayOf(1280,256,11520), intArrayOf(1280,64,11520))) {
+                val reg = benchMatmulTiled(mm, s[0], s[1], s[2], 128, 128, 15)
+                val spk = benchSplitK(sk, red, s[0], s[1], s[2], 4, 15)
+                sb.appendLine("conv16/8 ${s[0]}×${s[1]}×${s[2]}: reg=${"%.0f".format(reg)} sk4=${"%.0f".format(spk)}")
+            }
         }
         // conv2d на реальных слоях SD UNet: direct (наивный, в движке) vs im2col+matmul
         val convs = arrayOf(

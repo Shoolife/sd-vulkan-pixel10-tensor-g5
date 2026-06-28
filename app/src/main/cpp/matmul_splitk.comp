@@ -1,0 +1,58 @@
+#version 450
+// Split-K matmul для «высоких-узких» GEMM (большое K, малое N — низкоразрешённые conv).
+// G частей по K через gl_WorkGroupID.z → в G× больше рабочих групп (выше occupancy).
+// Каждая часть пишет ПАРТИАЛ в C[g] (потом отдельная редукция суммирует). fp32, vec4-A.
+#define BM 128
+#define BN 128
+#define BK 4
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) readonly buffer BufA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { vec4 B4[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { vec4 C4[]; };
+layout(push_constant) uniform Push { uint M, N, K, Kchunk; } p;
+
+shared vec4 As[BK][BM/4];
+shared vec4 Bs[BK][BN/4];
+
+void main() {
+    uint tid = gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x;
+    uint blockRow = gl_WorkGroupID.y * BM;
+    uint blockCol = gl_WorkGroupID.x * BN;
+    uint N4 = p.N / 4u;
+    uint tr4 = (tid / 16u) * 2u;
+    uint tcv = (tid % 16u) * 2u;
+    uint g = gl_WorkGroupID.z;                 // индекс K-части
+    uint k0 = g*p.Kchunk; uint k1 = min(k0+p.Kchunk, p.K);
+
+    vec4 acc0[8]; vec4 acc1[8];
+    for (int i=0;i<8;i++){ acc0[i]=vec4(0.0); acc1[i]=vec4(0.0); }
+
+    for (uint kk = k0; kk < k1; kk += BK) {
+        for (uint i = tid; i < BM*BK; i += 256u) {
+            uint r = i / BK, c = i % BK;
+            uint gr = blockRow + r, gc = kk + c;
+            As[c][r >> 2u][r & 3u] = (gr < p.M && gc < k1) ? A[gr*p.K + gc] : 0.0;
+        }
+        for (uint i = tid; i < BK*(BN/4u); i += 256u) {
+            uint r = i / (BN/4u), c = i % (BN/4u);
+            uint gr = kk + r; uint gcv = blockCol/4u + c;
+            Bs[r][c] = (gr < k1 && gcv < N4) ? B4[gr*N4 + gcv] : vec4(0.0);
+        }
+        barrier();
+        for (uint k = 0u; k < BK; k++) {
+            vec4 a0 = As[k][tr4]; vec4 a1 = As[k][tr4+1u];
+            vec4 b0 = Bs[k][tcv]; vec4 b1 = Bs[k][tcv+1u];
+            acc0[0]+=a0.x*b0; acc1[0]+=a0.x*b1; acc0[1]+=a0.y*b0; acc1[1]+=a0.y*b1;
+            acc0[2]+=a0.z*b0; acc1[2]+=a0.z*b1; acc0[3]+=a0.w*b0; acc1[3]+=a0.w*b1;
+            acc0[4]+=a1.x*b0; acc1[4]+=a1.x*b1; acc0[5]+=a1.y*b0; acc1[5]+=a1.y*b1;
+            acc0[6]+=a1.z*b0; acc1[6]+=a1.z*b1; acc0[7]+=a1.w*b0; acc1[7]+=a1.w*b1;
+        }
+        barrier();
+    }
+    uint cv = blockCol/4u + tcv;
+    uint pbase = g * p.M * N4;                  // партиал g
+    for (uint i = 0u; i < 8u; i++) {
+        uint gr = blockRow + tr4*4u + i;
+        if (gr < p.M){ if(cv<N4) C4[pbase + gr*N4 + cv]=acc0[i]; if(cv+1u<N4) C4[pbase + gr*N4 + cv+1u]=acc1[i]; }
+    }
+}
