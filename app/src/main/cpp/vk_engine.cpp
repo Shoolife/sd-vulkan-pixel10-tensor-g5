@@ -255,6 +255,36 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmul(
     return g;
 }
 
+// ====================== JNI: MATMUL с произвольным тайлом (для сравнения 64 vs 128) ======================
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_benchMatmulTiled(
+        JNIEnv* env, jobject, jbyteArray spirv, jint M, jint N, jint K, jint bm, jint bn, jint iters) {
+    VkCtx c; if(!c.init()) return -1;
+    jsize spvLen=env->GetArrayLength(spirv); std::vector<uint8_t> spv(spvLen);
+    env->GetByteArrayRegion(spirv,0,spvLen,(jbyte*)spv.data());
+    VkDeviceSize szA=(VkDeviceSize)M*K*4, szB=(VkDeviceSize)K*N*4, szC=(VkDeviceSize)M*N*4;
+    Buf bA=c.alloc(szA,true), bB=c.alloc(szB,true), bC=c.alloc(szC,true);
+    std::vector<float> hA((size_t)M*K), hB((size_t)K*N);
+    for (size_t i=0;i<hA.size();i++) hA[i]=(((i*131u+7u)%17u)*0.01f-0.08f);
+    for (size_t i=0;i<hB.size();i++) hB[i]=(((i*61u+13u)%19u)*0.01f-0.09f);
+    c.upload(bA,hA.data(),szA); c.upload(bB,hB.data(),szB);
+    Kernel k; k.create(c,spv.data(),spvLen,3,20);
+    VkDescriptorSet ds=k.makeSet(c,{&bA,&bB,&bC});
+    uint32_t pc[5]={(uint32_t)M,(uint32_t)N,(uint32_t)K,(uint32_t)N,0u};
+    uint32_t gx=((uint32_t)N+bn-1)/bn, gy=((uint32_t)M+bm-1)/bm;
+    { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,pc,gx,gy,1); c.endCmd(cmd); }
+    { std::vector<float> hC((size_t)M*N); c.download(bC,hC.data(),szC); double se=0,sr=0;
+      for(int s=0;s<16;s++){ int r=(s*97+3)%M,col=(s*53+11)%N; float ref=0;
+        for(int kk=0;kk<K;kk++) ref+=hA[(size_t)r*K+kk]*hB[(size_t)kk*N+col];
+        se+=fabsf(ref-hC[(size_t)r*N+col]); sr+=fabsf(ref);}
+      LOG("MMTILED %dx%dx%d bm%d bn%d corr=%.4f %s",M,N,K,bm,bn,se/(sr+1e-6),se/(sr+1e-6)<0.02?"OK":"FAIL"); }
+    double sec=timeDispatch(c,k,ds,pc,gx,gy,1,iters);
+    double g=2.0*(double)M*N*K/sec/1e9;
+    LOG("mmtiled %dx%dx%d bm%d bn%d: %.1f GFLOPS",M,N,K,bm,bn,g);
+    k.destroy(c); c.free(bA);c.free(bB);c.free(bC); c.destroy();
+    return g;
+}
+
 // ====================== JNI: MATMUL COOPERATIVE MATRIX (тензорные ядра) ======================
 // A[M,K] fp16, B[K,N] fp16, C[M,N] fp32. Требует M%16,N%64,K%16==0.
 extern "C" JNIEXPORT jdouble JNICALL

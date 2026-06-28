@@ -9,6 +9,7 @@ object VulkanBench {
 
     external fun benchMatmul(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
     external fun benchMatmulCoop(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
+    external fun benchMatmulTiled(spirv: ByteArray, m: Int, n: Int, k: Int, bm: Int, bn: Int, iters: Int): Double
     external fun benchConv(spirv: ByteArray, cin: Int, cout: Int, h: Int, w: Int, kh: Int, kw: Int, iters: Int): Double
     external fun benchConvGemm(im2col: ByteArray, matmul: ByteArray, cin: Int, cout: Int, h: Int, w: Int, kh: Int, kw: Int, iters: Int): Double
     external fun benchWinograd(winoIn: ByteArray, mmWino: ByteArray, winoOut: ByteArray, cin: Int, cout: Int, h: Int, w: Int, iters: Int): Double
