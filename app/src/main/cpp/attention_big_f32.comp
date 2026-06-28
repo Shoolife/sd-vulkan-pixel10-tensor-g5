@@ -9,21 +9,25 @@ layout(set=0,binding=0) readonly buffer BQ { vec4 Q[]; };
 layout(set=0,binding=1) readonly buffer BK { vec4 K[]; };
 layout(set=0,binding=2) readonly buffer BV { vec4 V[]; };
 layout(set=0,binding=3) writeonly buffer BO { vec4 O[]; };
-layout(push_constant) uniform P { uint seqQ, seqK, d, H; float scale; } p;
+// batch-aware: seqQpi/seqKpi на изображение, workgroup=(img, блок запросов). B=1: seqQpi=seqQ.
+layout(push_constant) uniform P { uint seqQ, seqK, d, H, seqQpi, seqKpi; float scale; } p;
 shared vec4 Ks[TK][MAXDD];
 shared vec4 Vs[TK][MAXDD];
 void main(){
-    uint tid=gl_LocalInvocationID.x; uint i=gl_WorkGroupID.x*TQ+tid; uint h=gl_WorkGroupID.y;
-    uint dd=p.d>>2; bool inr=(i<p.seqQ)&&(h<p.H);
+    uint tid=gl_LocalInvocationID.x;
+    uint blocksPerImg=(p.seqQpi+TQ-1u)/TQ; uint img=gl_WorkGroupID.x/blocksPerImg; uint qb=gl_WorkGroupID.x%blocksPerImg;
+    uint i=img*p.seqQpi + qb*TQ + tid; uint h=gl_WorkGroupID.y;
+    uint dd=p.d>>2; bool inr=(qb*TQ+tid<p.seqQpi)&&(h<p.H);
     vec4 q[MAXDD]; uint qv=(h*p.seqQ+i)*dd;
     if(inr) for(uint k=0u;k<dd;k++) q[k]=Q[qv+k];
     vec4 acc[MAXDD]; for(uint k=0u;k<dd;k++) acc[k]=vec4(0.0);
     float m=-3.0e38,l=0.0; uint hkv=h*p.seqK*dd; const float L2E=1.442695041f;
-    for(uint kb=0u;kb<p.seqK;kb+=TK){
+    uint kStart=img*p.seqKpi, kEnd=kStart+p.seqKpi;
+    for(uint kb=kStart;kb<kEnd;kb+=TK){
         for(uint t=tid;t<TK;t+=TQ){ uint jg=kb+t;
-            if(jg<p.seqK) for(uint k=0u;k<dd;k++){ Ks[t][k]=K[hkv+jg*dd+k]; Vs[t][k]=V[hkv+jg*dd+k]; } }
+            if(jg<kEnd) for(uint k=0u;k<dd;k++){ Ks[t][k]=K[hkv+jg*dd+k]; Vs[t][k]=V[hkv+jg*dd+k]; } }
         barrier();
-        if(inr){ uint cnt=min(uint(TK),p.seqK-kb);
+        if(inr){ uint cnt=min(uint(TK),kEnd-kb);
             for(uint jj=0u;jj<cnt;jj++){ float s=0.0; for(uint k=0u;k<dd;k++) s+=dot(q[k],Ks[jj][k]); s*=p.scale;
                 if(s>m){ float cr=exp2((m-s)*L2E); l*=cr; for(uint k=0u;k<dd;k++) acc[k]*=cr; m=s; }
                 float pj=exp2((s-m)*L2E); l+=pj;

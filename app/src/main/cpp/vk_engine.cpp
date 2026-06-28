@@ -541,7 +541,7 @@ struct GNp{uint32_t C,HW,G,B;float e;}; struct CVp{uint32_t Ci,Co,H,W,KH,KW,pad,
 static int gB=1;   // батч текущего forward (CFG: 2 = cond+uncond вместе). Раскладка [C, B*HW]
 struct ABp{uint32_t C,HW;}; struct AB2p{uint32_t n,C;}; struct T2p{uint32_t a,b;};
 struct LNp{uint32_t tok,C;float e;}; struct MMp{uint32_t M,N,K,Nfull,colOffV;}; struct SHp{uint32_t seq,nh,d;};
-struct ATp{uint32_t sQ,sK,d,H;float sc;}; struct N1p{uint32_t n;}; struct GGp{uint32_t tok,C2;};
+struct ATp{uint32_t sQ,sK,d,H,sQpi,sKpi;float sc;}; struct N1p{uint32_t n;}; struct GGp{uint32_t tok,C2;};
 static void matmul(Buf& a,Buf& b,Buf& y,uint32_t M,uint32_t N,uint32_t K,uint32_t Nfull=0,uint32_t colOffV=0);  // forward
 static void silu(Buf& x,uint32_t n){ N1p p{n}; op(SILU,{&x,&x},&p,4,(n+255)/256,1,1); }
 static void groupnorm(Buf& x,Buf& g,Buf& b,Buf& y,uint32_t Cc,uint32_t HW){ GNp p{Cc,HW,32,(uint32_t)gB,1e-5f}; op(GN,{&x,&g,&b,&y},&p,20,32u*(uint32_t)gB,1,1); }
@@ -620,54 +620,55 @@ static void stat(Buf& b, uint32_t n, const char* lbl){
 }
 // ResNet-блок: x[Cin,H,W] + temb[1280] → out[Cout,H,W]
 static Buf resnet(const std::string& pf, Buf& x, Buf& temb, uint32_t Cin, uint32_t Cout, uint32_t H, uint32_t Wd){
-    uint32_t HWi=H*Wd, Ni=Cin*HWi, No=Cout*HWi;
+    uint32_t Bf=(uint32_t)gB, HWi=H*Wd, HWf=Bf*HWi, Ni=Cin*HWf, No=Cout*HWf;   // HWi=на изображение, HWf=всего
     Buf h=mk((VkDeviceSize)Ni*4); groupnorm_silu(x,W(pf+".norm1.weight"),W(pf+".norm1.bias"),h,Cin,HWi);
-    Buf hc=mk((VkDeviceSize)No*4); conv(h,W(pf+".conv1.weight"),hc,Cin,Cout,H,Wd,3,1,1); addbias_c(hc,W(pf+".conv1.bias"),Cout,HWi);
-    // time emb
+    Buf hc=mk((VkDeviceSize)No*4); conv(h,W(pf+".conv1.weight"),hc,Cin,Cout,H,Wd,3,1,1); addbias_c(hc,W(pf+".conv1.bias"),Cout,HWf);
+    // time emb (один temb на оба изображения — тот же timestep)
     Buf ts=mk(1280*4); { N1p p{1280}; op(SILU,{&temb,&ts},&p,4,(1280+255)/256,1,1); }
     Buf tp=mk((VkDeviceSize)Cout*4); matmul(ts,W(pf+".time_emb_proj.weight"),tp,1,Cout,1280); addbias_l(tp,W(pf+".time_emb_proj.bias"),Cout,Cout);
-    { ABp p{Cout,HWi}; op(AB,{&hc,&tp},&p,8,(No+255)/256,1,1); }   // hc += tp broadcast
+    { ABp p{Cout,HWf}; op(AB,{&hc,&tp},&p,8,(No+255)/256,1,1); }   // hc += tp broadcast (по всем B*HW)
     Buf h2=mk((VkDeviceSize)No*4); groupnorm_silu(hc,W(pf+".norm2.weight"),W(pf+".norm2.bias"),h2,Cout,HWi);
-    Buf hc2=mk((VkDeviceSize)No*4); conv(h2,W(pf+".conv2.weight"),hc2,Cout,Cout,H,Wd,3,1,1); addbias_c(hc2,W(pf+".conv2.bias"),Cout,HWi);
+    Buf hc2=mk((VkDeviceSize)No*4); conv(h2,W(pf+".conv2.weight"),hc2,Cout,Cout,H,Wd,3,1,1); addbias_c(hc2,W(pf+".conv2.bias"),Cout,HWf);
     Buf out=mk((VkDeviceSize)No*4);
-    if (Cin!=Cout){ Buf sx=mk((VkDeviceSize)No*4); conv(x,W(pf+".conv_shortcut.weight"),sx,Cin,Cout,H,Wd,1,0,1); addbias_c(sx,W(pf+".conv_shortcut.bias"),Cout,HWi); addv(sx,hc2,out,No); }
+    if (Cin!=Cout){ Buf sx=mk((VkDeviceSize)No*4); conv(x,W(pf+".conv_shortcut.weight"),sx,Cin,Cout,H,Wd,1,0,1); addbias_c(sx,W(pf+".conv_shortcut.bias"),Cout,HWf); addv(sx,hc2,out,No); }
     else addv(x,hc2,out,No);
     return out;
 }
 
 // Transformer-блок (SpatialTransformer): x[C,H,W] + ctx[77,768] → out[C,H,W]
 static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uint32_t H, uint32_t Wd, uint32_t nh){
-    uint32_t HW=H*Wd, N=Cc*HW, d=Cc/nh, ctxN=77, C2=Cc*4, PROJ=Cc*8;
-    Buf g1=mk((VkDeviceSize)N*4); groupnorm(x,W(pf+".norm.weight"),W(pf+".norm.bias"),g1,Cc,HW);
-    Buf p1=mk((VkDeviceSize)N*4); conv(g1,W(pf+".proj_in.weight"),p1,Cc,Cc,H,Wd,1,0,1); addbias_c(p1,W(pf+".proj_in.bias"),Cc,HW);
-    Buf t=mk((VkDeviceSize)N*4); { T2p p{Cc,HW}; op(T_CH,{&p1,&t},&p,8,(N+255)/256,1,1); }
+    uint32_t Bf=(uint32_t)gB, HW=H*Wd, St=Bf*HW, N=Cc*St, d=Cc/nh, ctxN=77, Ct=Bf*ctxN, C2=Cc*4, PROJ=Cc*8;
+    float sc=1.0f/sqrtf((float)d); uint32_t gxA=Bf*((HW+127u)/128u);   // блоков запросов на весь батч
+    Buf g1=mk((VkDeviceSize)N*4); groupnorm(x,W(pf+".norm.weight"),W(pf+".norm.bias"),g1,Cc,HW);   // per-image
+    Buf p1=mk((VkDeviceSize)N*4); conv(g1,W(pf+".proj_in.weight"),p1,Cc,Cc,H,Wd,1,0,1); addbias_c(p1,W(pf+".proj_in.bias"),Cc,St);
+    Buf t=mk((VkDeviceSize)N*4); { T2p p{Cc,St}; op(T_CH,{&p1,&t},&p,8,(N+255)/256,1,1); }  // [Cc,B*HW]→[B*HW,Cc]
     std::string b=pf+".transformer_blocks.0";
     Buf h=mk((VkDeviceSize)N*4),q=mk((VkDeviceSize)N*4),k=mk((VkDeviceSize)N*4),v=mk((VkDeviceSize)N*4),a=mk((VkDeviceSize)N*4);
     Buf qh=mk((VkDeviceSize)N*4),kh=mk((VkDeviceSize)N*4),vh=mk((VkDeviceSize)N*4),ah=mk((VkDeviceSize)N*4);
     auto split=[&](Buf& src,Buf& dst,uint32_t seq){ SHp p{seq,nh,d}; op(SPLIT,{&src,&dst},&p,12,(seq*nh*d+255)/256,1,1); };
     auto merge=[&](Buf& src,Buf& dst,uint32_t seq){ SHp p{seq,nh,d}; op(MERGE,{&src,&dst},&p,12,(seq*nh*d+255)/256,1,1); };
     // self-attn
-    { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm1.weight"),&W(b+".norm1.bias"),&h},&p,12,HW,1,1); }
-    matmul(h,W(b+".attn1.to_q.weight"),q,HW,Cc,Cc); matmul(h,W(b+".attn1.to_k.weight"),k,HW,Cc,Cc); matmul(h,W(b+".attn1.to_v.weight"),v,HW,Cc,Cc);
-    split(q,qh,HW); split(k,kh,HW); split(v,vh,HW);
-    { ATp p{HW,HW,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&kh,&vh,&ah},&p,20,(HW+127)/128,nh,1);}else{op(ATTN_BIG,{&qh,&kh,&vh,&ah},&p,20,(HW+127)/128,nh,1);} }
-    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*4); matmul(a,W(b+".attn1.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn1.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
-    // cross-attn
-    { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm2.weight"),&W(b+".norm2.bias"),&h},&p,12,HW,1,1); }
-    matmul(h,W(b+".attn2.to_q.weight"),q,HW,Cc,Cc);
-    Buf kc=mk((VkDeviceSize)ctxN*Cc*4),vc=mk((VkDeviceSize)ctxN*Cc*4),khc=mk((VkDeviceSize)ctxN*Cc*4),vhc=mk((VkDeviceSize)ctxN*Cc*4);
-    matmul(ctx,W(b+".attn2.to_k.weight"),kc,ctxN,Cc,768); matmul(ctx,W(b+".attn2.to_v.weight"),vc,ctxN,Cc,768);
-    split(q,qh,HW); split(kc,khc,ctxN); split(vc,vhc,ctxN);
-    { ATp p{HW,ctxN,d,nh,1.0f/sqrtf((float)d)}; if(d<=40){op(ATTN,{&qh,&khc,&vhc,&ah},&p,20,(HW+127)/128,nh,1);}else{op(ATTN_BIG,{&qh,&khc,&vhc,&ah},&p,20,(HW+127)/128,nh,1);} }
-    merge(ah,a,HW); { Buf ao=mk((VkDeviceSize)N*4); matmul(a,W(b+".attn2.to_out.0.weight"),ao,HW,Cc,Cc); addbias_l(ao,W(b+".attn2.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
+    { LNp p{St,Cc,1e-5f}; op(LN,{&t,&W(b+".norm1.weight"),&W(b+".norm1.bias"),&h},&p,12,St,1,1); }
+    matmul(h,W(b+".attn1.to_q.weight"),q,St,Cc,Cc); matmul(h,W(b+".attn1.to_k.weight"),k,St,Cc,Cc); matmul(h,W(b+".attn1.to_v.weight"),v,St,Cc,Cc);
+    split(q,qh,St); split(k,kh,St); split(v,vh,St);
+    { ATp p{St,St,d,nh,HW,HW,sc}; if(d<=40){op(ATTN,{&qh,&kh,&vh,&ah},&p,28,gxA,nh,1);}else{op(ATTN_BIG,{&qh,&kh,&vh,&ah},&p,28,gxA,nh,1);} }
+    merge(ah,a,St); { Buf ao=mk((VkDeviceSize)N*4); matmul(a,W(b+".attn1.to_out.0.weight"),ao,St,Cc,Cc); addbias_l(ao,W(b+".attn1.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
+    // cross-attn (контекст свой на изображение: [B*ctxN, 768])
+    { LNp p{St,Cc,1e-5f}; op(LN,{&t,&W(b+".norm2.weight"),&W(b+".norm2.bias"),&h},&p,12,St,1,1); }
+    matmul(h,W(b+".attn2.to_q.weight"),q,St,Cc,Cc);
+    Buf kc=mk((VkDeviceSize)Ct*Cc*4),vc=mk((VkDeviceSize)Ct*Cc*4),khc=mk((VkDeviceSize)Ct*Cc*4),vhc=mk((VkDeviceSize)Ct*Cc*4);
+    matmul(ctx,W(b+".attn2.to_k.weight"),kc,Ct,Cc,768); matmul(ctx,W(b+".attn2.to_v.weight"),vc,Ct,Cc,768);
+    split(q,qh,St); split(kc,khc,Ct); split(vc,vhc,Ct);
+    { ATp p{St,Ct,d,nh,HW,ctxN,sc}; if(d<=40){op(ATTN,{&qh,&khc,&vhc,&ah},&p,28,gxA,nh,1);}else{op(ATTN_BIG,{&qh,&khc,&vhc,&ah},&p,28,gxA,nh,1);} }
+    merge(ah,a,St); { Buf ao=mk((VkDeviceSize)N*4); matmul(a,W(b+".attn2.to_out.0.weight"),ao,St,Cc,Cc); addbias_l(ao,W(b+".attn2.to_out.0.bias"),N,Cc); addv(t,ao,t,N); }
     // ff GEGLU
-    { LNp p{HW,Cc,1e-5f}; op(LN,{&t,&W(b+".norm3.weight"),&W(b+".norm3.bias"),&h},&p,12,HW,1,1); }
-    Buf gg=mk((VkDeviceSize)HW*PROJ*4); matmul(h,W(b+".ff.net.0.proj.weight"),gg,HW,PROJ,Cc); addbias_l(gg,W(b+".ff.net.0.proj.bias"),HW*PROJ,PROJ);
-    Buf gf=mk((VkDeviceSize)HW*C2*4); { GGp p{HW,C2}; op(GEGLU,{&gg,&gf},&p,8,(HW*C2+255)/256,1,1); }
-    Buf ff=mk((VkDeviceSize)N*4); matmul(gf,W(b+".ff.net.2.weight"),ff,HW,Cc,C2); addbias_l(ff,W(b+".ff.net.2.bias"),N,Cc); addv(t,ff,t,N);
+    { LNp p{St,Cc,1e-5f}; op(LN,{&t,&W(b+".norm3.weight"),&W(b+".norm3.bias"),&h},&p,12,St,1,1); }
+    Buf gg=mk((VkDeviceSize)St*PROJ*4); matmul(h,W(b+".ff.net.0.proj.weight"),gg,St,PROJ,Cc); addbias_l(gg,W(b+".ff.net.0.proj.bias"),St*PROJ,PROJ);
+    Buf gf=mk((VkDeviceSize)St*C2*4); { GGp p{St,C2}; op(GEGLU,{&gg,&gf},&p,8,(St*C2+255)/256,1,1); }
+    Buf ff=mk((VkDeviceSize)N*4); matmul(gf,W(b+".ff.net.2.weight"),ff,St,Cc,C2); addbias_l(ff,W(b+".ff.net.2.bias"),N,Cc); addv(t,ff,t,N);
     // proj_out + residual
-    Buf tt=mk((VkDeviceSize)N*4); { T2p p{HW,Cc}; op(T_HC,{&t,&tt},&p,8,(N+255)/256,1,1); }
-    Buf po=mk((VkDeviceSize)N*4); conv(tt,W(pf+".proj_out.weight"),po,Cc,Cc,H,Wd,1,0,1); addbias_c(po,W(pf+".proj_out.bias"),Cc,HW);
+    Buf tt=mk((VkDeviceSize)N*4); { T2p p{St,Cc}; op(T_HC,{&t,&tt},&p,8,(N+255)/256,1,1); }  // [B*HW,Cc]→[Cc,B*HW]
+    Buf po=mk((VkDeviceSize)N*4); conv(tt,W(pf+".proj_out.weight"),po,Cc,Cc,H,Wd,1,0,1); addbias_c(po,W(pf+".proj_out.bias"),Cc,St);
     Buf out=mk((VkDeviceSize)N*4); addv(x,po,out,N);
     return out;
 }
@@ -1037,9 +1038,9 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_benchAttention(
     for(size_t i=0;i<hV.size();i++) hV[i]=(((i*97u+5u)%17u)*0.05f-0.4f);
     c.upload(bQ,hQ.data(),szQ); c.upload(bK,hK.data(),szK); c.upload(bV,hV.data(),szK);
 
-    Kernel k; k.create(c,spv.data(),spv.size(),4,20); VkDescriptorSet ds=k.makeSet(c,{&bQ,&bK,&bV,&bO});
+    Kernel k; k.create(c,spv.data(),spv.size(),4,28); VkDescriptorSet ds=k.makeSet(c,{&bQ,&bK,&bV,&bO});
     float scale=1.0f/sqrtf((float)d);
-    struct { uint32_t sQ,sK,d,H; float sc; } pc{(uint32_t)seqQ,(uint32_t)seqK,(uint32_t)d,(uint32_t)H,scale};
+    struct { uint32_t sQ,sK,d,H,sQpi,sKpi; float sc; } pc{(uint32_t)seqQ,(uint32_t)seqK,(uint32_t)d,(uint32_t)H,(uint32_t)seqQ,(uint32_t)seqK,scale};
     uint32_t gx=((uint32_t)seqQ+(uint32_t)tq-1u)/(uint32_t)tq, gy=(uint32_t)H;
 
     { VkCommandBuffer cmd=c.beginCmd(); k.record(cmd,ds,&pc,gx,gy,1); c.endCmd(cmd); }
