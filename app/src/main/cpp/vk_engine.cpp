@@ -185,7 +185,8 @@ struct Kernel {
     VkDescriptorSet makeSet(VkCtx& c, std::vector<Buf*> bufs){
         VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         ai.descriptorPool=dp; ai.descriptorSetCount=1; ai.pSetLayouts=&dsl;
-        VkDescriptorSet ds; vkAllocateDescriptorSets(c.dev,&ai,&ds);
+        VkDescriptorSet ds=VK_NULL_HANDLE; VkResult ar=vkAllocateDescriptorSets(c.dev,&ai,&ds);
+        if(ar!=VK_SUCCESS){ LOG("!!! DESC POOL OVERFLOW nBuf=%d res=%d — увеличь POOL_SETS",(int)bufs.size(),(int)ar); }
         std::vector<VkDescriptorBufferInfo> bi(bufs.size());
         std::vector<VkWriteDescriptorSet> wr(bufs.size());
         for (size_t i=0;i<bufs.size();i++){
@@ -511,7 +512,7 @@ static Buf mk(VkDeviceSize bytes){ Buf b=C_->alloc(bytes,true); SCRATCH_.push_ba
 //     все dispatch'и пишутся в один gCmd с барьерами памяти, submit/waitIdle 1 раз за forward ---
 static Kernel gK[NSH]; static bool gKi[NSH]={false};
 static VkCommandBuffer gCmd=VK_NULL_HANDLE;
-static const int POOL_SETS=1024;  // макс. дескрипторов одного шейдера за forward (с запасом)
+static const int POOL_SETS=4096;  // макс. дескрипторов одного шейдера за forward (B=2: conv-цикл + N-tiling удваивают)
 static Kernel& kern(int si,int nBuf,uint32_t pb){
     if(!gKi[si]){ gK[si].create(*C_,(*SH_)[si].data(),(*SH_)[si].size(),nBuf,pb,POOL_SETS); gKi[si]=true; }
     return gK[si];
@@ -686,13 +687,13 @@ static Buf concat(Buf& prev, uint32_t Cp, Buf& skip, uint32_t Cs, uint32_t HW){
     return out;
 }
 static Buf downsample(const std::string& pf, Buf& x, uint32_t Cc, uint32_t H, uint32_t Wd){
-    uint32_t Ho=H/2, Wo=Wd/2; Buf y=mk((VkDeviceSize)Cc*Ho*Wo*4);
-    conv(x,W(pf+".conv.weight"),y,Cc,Cc,H,Wd,3,1,2); addbias_c(y,W(pf+".conv.bias"),Cc,Ho*Wo); return y;
+    uint32_t Bf=(uint32_t)gB, Ho=H/2, Wo=Wd/2; Buf y=mk((VkDeviceSize)Cc*Bf*Ho*Wo*4);   // [C, B*Ho*Wo]
+    conv(x,W(pf+".conv.weight"),y,Cc,Cc,H,Wd,3,1,2); addbias_c(y,W(pf+".conv.bias"),Cc,Bf*Ho*Wo); return y;
 }
 static Buf upsample(const std::string& pf, Buf& x, uint32_t Cc, uint32_t H, uint32_t Wd){
-    uint32_t Ho=H*2, Wo=Wd*2; Buf u=mk((VkDeviceSize)Cc*Ho*Wo*4);  // 2× upsample (геометрия)
-    { struct{uint32_t C,H,W;}p{Cc,H,Wd}; op(UP,{&x,&u},&p,12,(Cc*Ho*Wo+255)/256,1,1); }
-    Buf y=mk((VkDeviceSize)Cc*Ho*Wo*4); conv(u,W(pf+".conv.weight"),y,Cc,Cc,Ho,Wo,3,1,1); addbias_c(y,W(pf+".conv.bias"),Cc,Ho*Wo); return y;
+    uint32_t Bf=(uint32_t)gB, Ho=H*2, Wo=Wd*2; Buf u=mk((VkDeviceSize)Cc*Bf*Ho*Wo*4);  // 2× upsample, [C, B*Ho*Wo]
+    { struct{uint32_t C,H,W,B;}p{Cc,H,Wd,Bf}; op(UP,{&x,&u},&p,16,(Cc*Bf*Ho*Wo+255)/256,1,1); }
+    Buf y=mk((VkDeviceSize)Cc*Bf*Ho*Wo*4); conv(u,W(pf+".conv.weight"),y,Cc,Cc,Ho,Wo,3,1,1); addbias_c(y,W(pf+".conv.bias"),Cc,Bf*Ho*Wo); return y;
 }
 static double corrCheck(Buf& got, const std::string& refName, uint32_t n){
     std::string p=DIR_+"/"+refName+".bin"; int64_t sz=fsize(p); if(sz<0) return -1;
@@ -708,13 +709,14 @@ static void resetKernelPools(){ for(int i=0;i<NSH;i++) if(gKi[i]) gK[i].resetPoo
 static Buf gCache[2]; static VkDeviceSize gCacheCap=0;
 // mode: 0=full (считаем всё + сохраняем кэш), 1=cached (пропускаем deep, берём кэш). slot: 0=cond,1=uncond.
 static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
+    uint32_t Bf=(uint32_t)gB;         // батч (CFG: 2 = cond+uncond вместе)
     resetKernelPools();              // дескриптор-сеты прошлого forward освобождаем
     if(!gProfile) gCmd=C_->beginCmd();  // один command buffer на весь граф (в профиле — по-оп)
-    // time embedding MLP
+    // time embedding MLP (один temb на оба изображения — тот же timestep)
     Buf t1=mk(1280*4); matmul(tembp,W("time_embedding.linear_1.weight"),t1,1,1280,320); addbias_l(t1,W("time_embedding.linear_1.bias"),1280,1280); silu(t1,1280);
     Buf temb=mk(1280*4); matmul(t1,W("time_embedding.linear_2.weight"),temb,1,1280,1280); addbias_l(temb,W("time_embedding.linear_2.bias"),1280,1280);
-    // conv_in: 4→320
-    Buf x=mk((VkDeviceSize)320*64*64*4); conv(lat,W("conv_in.weight"),x,4,320,64,64,3,1,1); addbias_c(x,W("conv_in.bias"),320,64*64);
+    // conv_in: 4→320 (раскладка [C, B*HW])
+    Buf x=mk((VkDeviceSize)320*Bf*64*64*4); conv(lat,W("conv_in.weight"),x,4,320,64,64,3,1,1); addbias_c(x,W("conv_in.bias"),320,Bf*64*64);
     std::vector<Buf> skips; skips.push_back(x);
     uint32_t bo[4]={320,640,1280,1280};
     char pre[48];
@@ -748,8 +750,8 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
             uint32_t Cout=upout[i];
             for (int r=0;r<3;r++){
                 Buf skip=skips.back(); skips.pop_back();
-                uint32_t Cskip=(uint32_t)(skip.size/4/((VkDeviceSize)H*H));
-                Buf cc=concat(x,Cprev,skip,Cskip,H*H);
+                uint32_t Cskip=(uint32_t)(skip.size/4/((VkDeviceSize)Bf*H*H));
+                Buf cc=concat(x,Cprev,skip,Cskip,Bf*H*H);
                 snprintf(pre,48,"up_blocks.%d.resnets.%d",i,r);
                 x=resnet(pre,cc,temb,Cprev+Cskip,Cout,H,H); Cprev=Cout;
                 if (i>0){ snprintf(pre,48,"up_blocks.%d.attentions.%d",i,r); x=transformer(pre,x,ctx,Cout,H,H,8); }
@@ -757,7 +759,7 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
             snprintf(pre,48,"up_blocks.%d.upsamplers.0",i); x=upsample(pre,x,Cout,H,H); H*=2;
         }
         // x теперь 640@64² (вход up[3]) — сохраняем в кэш слота (не в профиль-режиме: там gCmd=NULL)
-        if (!gProfile){
+        if (!gProfile && gB==1){   // DeepCache-кэш (дормант, только batch=1)
             VkDeviceSize csz=(VkDeviceSize)640*64*64*4;
             if (gCacheCap==0){ gCache[0]=C_->alloc(csz,true); gCache[1]=C_->alloc(csz,true); gCacheCap=csz; }
             barrier(); VkBufferCopy cp{0,0,csz}; vkCmdCopyBuffer(gCmd,x.buf,gCache[slot].buf,1,&cp); barrier();
@@ -769,15 +771,15 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
     // ---- UP[3] (всегда) ----
     for (int r=0;r<3;r++){
         Buf skip=skips.back(); skips.pop_back();
-        uint32_t Cskip=(uint32_t)(skip.size/4/((VkDeviceSize)H*H));
-        Buf cc=concat(x,Cprev,skip,Cskip,H*H);
+        uint32_t Cskip=(uint32_t)(skip.size/4/((VkDeviceSize)Bf*H*H));
+        Buf cc=concat(x,Cprev,skip,Cskip,Bf*H*H);
         snprintf(pre,48,"up_blocks.3.resnets.%d",r);
         x=resnet(pre,cc,temb,Cprev+Cskip,320,H,H); Cprev=320;
         snprintf(pre,48,"up_blocks.3.attentions.%d",r); x=transformer(pre,x,ctx,320,H,H,8);
     }
     // ---- OUT ---- groupnorm+silu+conv_out(320→4)
-    Buf gno=mk((VkDeviceSize)320*H*H*4); groupnorm_silu(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H);
-    Buf y=mk((VkDeviceSize)4*H*H*4); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,H*H);
+    Buf gno=mk((VkDeviceSize)320*Bf*H*H*4); groupnorm_silu(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H);
+    Buf y=mk((VkDeviceSize)4*Bf*H*H*4); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,Bf*H*H);
     if (!gProfile){  // один submit на весь forward
         vkEndCommandBuffer(gCmd);
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&gCmd;
@@ -818,6 +820,23 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetSelfTest(JNIEnv*, jobject
     double e=corrCheck(noise,"OUT_y",4*64*64);
     LOG("UNET SELFTEST fp32 corr=%.4f %s",e,e<0.1?"OK":"FAIL");
     for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();
+    // B=2 self-test: тот же вход в ОБА слота батча → image0/image1 должны совпасть с OUT_y.
+    {   const uint32_t HW=64u*64u, LAT=4u*HW, CTX=77u*768u;
+        std::vector<__fp16> lh(LAT); { FILE* f=fopen((DIR_+"/IN_lat.bin").c_str(),"rb"); if(f){fread(lh.data(),2,LAT,f);fclose(f);} }
+        std::vector<__fp16> ch(CTX); { FILE* f=fopen((DIR_+"/IN_ctx.bin").c_str(),"rb"); if(f){fread(ch.data(),2,CTX,f);fclose(f);} }
+        std::vector<float> lat2((size_t)4*2*HW); for(uint32_t c=0;c<4;c++)for(uint32_t b=0;b<2;b++)for(uint32_t p=0;p<HW;p++) lat2[c*2*HW+b*HW+p]=(float)lh[c*HW+p];
+        std::vector<float> ctx2((size_t)2*CTX); for(uint32_t i=0;i<CTX;i++){ ctx2[i]=(float)ch[i]; ctx2[CTX+i]=(float)ch[i]; }
+        Buf bL=mk((VkDeviceSize)4*2*HW*4); gCtx.upload(bL,lat2.data(),(VkDeviceSize)4*2*HW*4);
+        Buf bC=mk((VkDeviceSize)2*CTX*4); gCtx.upload(bC,ctx2.data(),(VkDeviceSize)2*CTX*4);
+        Buf tp2=loadF("IN_temb_proj",320);
+        gB=2; Buf n2=runGraph(bL,tp2,bC,0,0); gB=1;
+        std::vector<float> nf((size_t)4*2*HW); gCtx.download(n2,nf.data(),(VkDeviceSize)4*2*HW*4);
+        std::vector<__fp16> rf; { FILE* f=fopen((DIR_+"/OUT_y.bin").c_str(),"rb"); if(f){rf.resize(LAT);fread(rf.data(),2,LAT,f);fclose(f);} }
+        double e0=0,e1=0,sr=0; for(uint32_t c=0;c<4;c++)for(uint32_t p=0;p<HW;p++){ uint32_t i=c*HW+p; float r=(float)rf[i];
+            e0+=fabsf(r-nf[c*2*HW+p]); e1+=fabsf(r-nf[c*2*HW+HW+p]); sr+=fabsf(r); }
+        LOG("UNET B=2 SELFTEST img0=%.4f img1=%.4f %s",e0/(sr+1e-6),e1/(sr+1e-6),(e0/(sr+1e-6)<0.1&&e1/(sr+1e-6)<0.1)?"OK":"FAIL");
+        for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();
+    }
     if (has("IN_cond")){
         Buf l2=loadF("IN_lat",4*64*64), t2=loadF("IN_temb999",320), cc=loadF("IN_cond",77*768);
         Buf ec=runGraph(l2,t2,cc); std::vector<float> vc(4*64*64); gCtx.download(ec,vc.data(),(VkDeviceSize)4*64*64*4);
@@ -864,6 +883,32 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetForward(
     std::vector<uint8_t> out((size_t)4*64*64*4); gCtx.download(noise,out.data(),out.size());
     jbyteArray res=env->NewByteArray((jsize)out.size()); env->SetByteArrayRegion(res,0,(jsize)out.size(),(jbyte*)out.data());
     for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();   // освобождаем временные, веса остаются
+    return res;
+}
+
+// batch-CFG forward: lat[4*64*64] (общий для cond/uncond), temb[320], condCtx/uncondCtx[77*768]
+// → [cond_noise(4*64*64), uncond_noise(4*64*64)]. Считает оба прохода вместе (B=2).
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_example_generet_1image_1ai_sd_VulkanBench_unetForward2(
+        JNIEnv* env, jobject, jbyteArray latB, jbyteArray tembB, jbyteArray condB, jbyteArray uncondB) {
+    using namespace unet; if(!gInit) return nullptr;
+    const uint32_t HW=64u*64u, LAT=4u*HW, CTX=77u*768u;
+    std::vector<uint8_t> lv(LAT*4); env->GetByteArrayRegion(latB,0,LAT*4,(jbyte*)lv.data());
+    float* lf=(float*)lv.data();
+    std::vector<float> lat2((size_t)4*2*HW);          // [4, 2*HW]: оба изображения = тот же латент
+    for(uint32_t c=0;c<4;c++) for(uint32_t b=0;b<2;b++) for(uint32_t p=0;p<HW;p++) lat2[c*2*HW + b*HW + p]=lf[c*HW+p];
+    Buf bLat=mk((VkDeviceSize)4*2*HW*4); gCtx.upload(bLat,lat2.data(),(VkDeviceSize)4*2*HW*4);
+    Buf bT=mk(320*4); { std::vector<uint8_t> tv(320*4); env->GetByteArrayRegion(tembB,0,320*4,(jbyte*)tv.data()); gCtx.upload(bT,tv.data(),320*4); }
+    std::vector<float> ctx2((size_t)2*CTX);           // [2*77, 768]: cond затем uncond
+    { std::vector<uint8_t> cv(CTX*4); env->GetByteArrayRegion(condB,0,CTX*4,(jbyte*)cv.data()); memcpy(ctx2.data(),cv.data(),CTX*4);
+      env->GetByteArrayRegion(uncondB,0,CTX*4,(jbyte*)cv.data()); memcpy(ctx2.data()+CTX,cv.data(),CTX*4); }
+    Buf bCtx=mk((VkDeviceSize)2*CTX*4); gCtx.upload(bCtx,ctx2.data(),(VkDeviceSize)2*CTX*4);
+    gB=2; Buf noise=runGraph(bLat,bT,bCtx,0,0); gB=1;
+    std::vector<float> nf((size_t)4*2*HW); gCtx.download(noise,nf.data(),(VkDeviceSize)4*2*HW*4);
+    std::vector<float> out((size_t)2*LAT);            // cond(image0) затем uncond(image1)
+    for(uint32_t c=0;c<4;c++) for(uint32_t p=0;p<HW;p++){ out[c*HW+p]=nf[c*2*HW+p]; out[LAT + c*HW+p]=nf[c*2*HW+HW+p]; }
+    jbyteArray res=env->NewByteArray((jsize)(2*LAT*4)); env->SetByteArrayRegion(res,0,(jsize)(2*LAT*4),(jbyte*)out.data());
+    for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();
     return res;
 }
 

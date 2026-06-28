@@ -79,10 +79,10 @@ class VulkanUnetPipeline(private val context: Context) {
         for ((idx, t) in sched.timesteps.withIndex()) {
             onStep(idx, steps)
             val tembB = toF32(timeProj(t)); val latB = toF32(latents)
-            // DeepCache отключён: несовместим с 4-шаговым LCM (relErr ~20% на 1 кэш-шаге —
-            // LCM уже выжал межшаговую избыточность, на которой работает кэш). Всегда full.
-            val cond = fromF32(VulkanBench.unetForward(latB, tembB, condCtx, 0, 0))
-            val uncond = fromF32(VulkanBench.unetForward(latB, tembB, uncondCtx, 0, 1))
+            // batch-CFG: cond+uncond в ОДНОМ forward (B=2) — лучше occupancy тонких matmul + меньше overhead
+            val both = VulkanBench.unetForward2(latB, tembB, condCtx, uncondCtx)
+            val cond = fromF32(both.copyOfRange(0, latSize * 4))
+            val uncond = fromF32(both.copyOfRange(latSize * 4, 2 * latSize * 4))
             val eps = FloatArray(latSize) { uncond[it] + cfgScale * (cond[it] - uncond[it]) }
             val noise = if (idx == steps - 1) null else FloatArray(latSize) { gaussian(rnd) }
             latents = sched.step(latents, eps, noise)
