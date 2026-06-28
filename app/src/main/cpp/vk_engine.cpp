@@ -443,7 +443,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_runResnetBlock(
 #include <cerrno>
 namespace unet {
 // шейдеры по индексу (порядок задаёт Kotlin)
-enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, IM2COL, WIN_IN, MM_WINO, WIN_OUT, WIN_WT, GN_SILU, NSH };
+enum S { GN=0, SILU, CONV, MM, AB, AB2, ADD, LN, SPLIT, ATTN, MERGE, GEGLU, T_CH, T_HC, UP, ATTN_BIG, IM2COL, WIN_IN, MM_WINO, WIN_OUT, WIN_WT, GN_SILU, WIN_MM64, NSH };
 static VkCtx* C_; static std::vector<std::vector<uint8_t>>* SH_; static std::string DIR_;
 static std::map<std::string,Buf> WC_;  // кэш весов (персистентный)
 static std::map<uint64_t,Buf> WCW_;    // кэш Winograd-трансформированных весов U (по buf-хэндлу)
@@ -532,7 +532,9 @@ static void conv(Buf& x,Buf& w,Buf& y,uint32_t Ci,uint32_t Co,uint32_t H,uint32_
         if (winoFit((VkDeviceSize)36*Ci*nT*4,(VkDeviceSize)36*Co*nT*4)){
             Buf& u=Wwino(w,Co,Ci);
             { struct{uint32_t IC,H,W,ntx,nty;}p{Ci,H,Wd,ntx,nty}; op(WIN_IN,{&x,&gWV},&p,20,(Ci*nT+63)/64,1,1); }
-            { uint32_t p[3]={Co,nT,Ci}; op(MM_WINO,{&u,&gWV,&gWM},p,12,(nT+127)/128,(Co+127)/128,36); }  // 36 ξ через z-dim
+            // 36 ξ через z-dim; на 32²/16² (nT<128) — BN=64 ядро (иначе половина N-тайла пустая)
+            if (nT>=128) { uint32_t p[3]={Co,nT,Ci}; op(MM_WINO,{&u,&gWV,&gWM},p,12,(nT+127)/128,(Co+127)/128,36); }
+            else { uint32_t p[3]={Co,nT,Ci}; op(WIN_MM64,{&u,&gWV,&gWM},p,12,(nT+63)/64,(Co+127)/128,36); }
             { struct{uint32_t OC,H,W,ntx,nty;}p{Co,H,Wd,ntx,nty}; op(WIN_OUT,{&gWM,&y},&p,20,(Co*nT+63)/64,1,1); }
             return;
         }
@@ -790,7 +792,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetProfile(JNIEnv*, jobject)
     gProfile=true;
     Buf noise=runGraph(lat,tp,ctx); (void)noise;
     gProfile=false;
-    const char* nm[NSH]={"GN","SILU","CONV","MM","AB","AB2","ADD","LN","SPLIT","ATTN","MERGE","GEGLU","T_CH","T_HC","UP","ATTN_BIG","IM2COL","WIN_IN","MM_WINO","WIN_OUT","WIN_WT","GN_SILU"};
+    const char* nm[NSH]={"GN","SILU","CONV","MM","AB","AB2","ADD","LN","SPLIT","ATTN","MERGE","GEGLU","T_CH","T_HC","UP","ATTN_BIG","IM2COL","WIN_IN","MM_WINO","WIN_OUT","WIN_WT","GN_SILU","WIN_MM64"};
     double tot=0; for(int i=0;i<NSH;i++) tot+=gProfT[i];
     LOG("=== PROFILE forward total=%.1f ms ===", tot*1000.0);
     for(int i=0;i<NSH;i++) if(gProfN[i]>0)

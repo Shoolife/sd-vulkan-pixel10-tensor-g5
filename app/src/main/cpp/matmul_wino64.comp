@@ -1,0 +1,55 @@
+#version 450
+// matmul_wino с BN=64 — для Winograd на 32²/16² (nTiles=64/16 < 128, иначе половина
+// N-тайла пустая). Тайл 128×64, поток = 8 строк × 1 vec4. ξ = gl_WorkGroupID.z (36 позиций).
+#define BM 128
+#define BN 64
+#define BK 4
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) readonly buffer BufA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { vec4 B4[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { vec4 C4[]; };
+layout(push_constant) uniform Push { uint M, N, K; } p;
+
+shared vec4 As[BK][BM/4];   // 4×32
+shared vec4 Bs[BK][BN/4];   // 4×16
+
+void main() {
+    uint tid = gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x;
+    uint blockRow = gl_WorkGroupID.y * BM;
+    uint blockCol = gl_WorkGroupID.x * BN;
+    uint N4 = p.N / 4u;
+    uint tr4 = (tid / 16u) * 2u;        // 2 vec4 строки на поток (8 строк)
+    uint tcv = tid % 16u;               // 1 vec4 столбец
+    uint xi = gl_WorkGroupID.z;
+    uint aBase = xi*p.M*p.K, bBaseV = xi*p.K*N4, cBaseV = xi*p.M*N4;
+
+    vec4 acc[8];
+    for (int i=0;i<8;i++) acc[i]=vec4(0.0);
+
+    uint tiles = (p.K + BK - 1u) / BK;
+    for (uint t = 0u; t < tiles; t++) {
+        for (uint i = tid; i < BM*BK; i += 256u) {
+            uint r = i / BK, c = i % BK;
+            uint gr = blockRow + r, gc = t*BK + c;
+            As[c][r >> 2u][r & 3u] = (gr < p.M && gc < p.K) ? A[aBase + gr*p.K + gc] : 0.0;
+        }
+        for (uint i = tid; i < BK*(BN/4u); i += 256u) {
+            uint r = i / (BN/4u), c = i % (BN/4u);
+            uint gr = t*BK + r; uint gcv = blockCol/4u + c;
+            Bs[r][c] = (gr < p.K && gcv < N4) ? B4[bBaseV + gr*N4 + gcv] : vec4(0.0);
+        }
+        barrier();
+        for (uint k = 0u; k < BK; k++) {
+            vec4 a0 = As[k][tr4]; vec4 a1 = As[k][tr4+1u];
+            vec4 b = Bs[k][tcv];
+            acc[0]+=a0.x*b; acc[1]+=a0.y*b; acc[2]+=a0.z*b; acc[3]+=a0.w*b;
+            acc[4]+=a1.x*b; acc[5]+=a1.y*b; acc[6]+=a1.z*b; acc[7]+=a1.w*b;
+        }
+        barrier();
+    }
+    uint cv = blockCol/4u + tcv;
+    for (uint i = 0u; i < 8u; i++) {
+        uint gr = blockRow + tr4*4u + i;
+        if (gr < p.M && cv < N4) C4[cBaseV + gr*N4 + cv]=acc[i];
+    }
+}

@@ -31,7 +31,7 @@ object VulkanBench {
             sh("addbias2"), sh("add"), sh("layernorm"), sh("split_heads"), sh("attention"),
             sh("merge_heads"), sh("geglu"), sh("t_chw2hwc"), sh("t_hwc2chw"), sh("upsample"), sh("attention_big"),
             sh("im2col"), sh("winograd_in"), sh("matmul_wino"), sh("winograd_out"), sh("winograd_wt"),
-            sh("groupnorm_silu"))
+            sh("groupnorm_silu"), sh("matmul_wino64"))
     }
 
     fun transformerCheck(ctx: Context): String {
