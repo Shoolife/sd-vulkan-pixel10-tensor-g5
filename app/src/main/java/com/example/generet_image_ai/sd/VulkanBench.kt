@@ -8,6 +8,7 @@ object VulkanBench {
     init { System.loadLibrary("vkbench") }
 
     external fun benchMatmul(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
+    external fun benchMatmulF16(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
     external fun benchMatmulCoop(spirv: ByteArray, m: Int, n: Int, k: Int, iters: Int): Double
     external fun benchMatmulTiled(spirv: ByteArray, m: Int, n: Int, k: Int, bm: Int, bn: Int, iters: Int): Double
     external fun benchSplitK(sk: ByteArray, red: ByteArray, m: Int, n: Int, k: Int, g: Int, iters: Int): Double
@@ -77,6 +78,10 @@ object VulkanBench {
         )
         for (s in shapes) {
             sb.appendLine("mm ${s[0]}×${s[1]}×${s[2]}: ${"%.0f".format(benchMatmul(mm, s[0], s[1], s[2], 20))} GFLOPS")
+        }
+        // fp16-matmul пробник: fp16-хранение vs fp32. corr в логе (ждём OK + рост GFLOPS).
+        runCatching { context.assets.open("shaders/matmul_f16.spv").use { it.readBytes() } }.getOrNull()?.let { mf ->
+            for (s in shapes) sb.appendLine("mm-F16 ${s[0]}×${s[1]}×${s[2]}: ${"%.0f".format(benchMatmulF16(mf, s[0], s[1], s[2], 20))} GFLOPS")
         }
         // split-K на формах низкоразрешённых conv (M=Cout, N=nTiles, K=Cin*9): regular vs G=4
         val sk = runCatching { context.assets.open("shaders/matmul_splitk.spv").use { it.readBytes() } }.getOrNull()
