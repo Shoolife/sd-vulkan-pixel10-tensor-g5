@@ -30,11 +30,12 @@ object VulkanBench {
     fun unetShaders(ctx: Context): Array<ByteArray> {
         fun sh(n: String) = ctx.assets.open("shaders/$n.spv").use { it.readBytes() }
         // порядок = enum S в C++
-        return arrayOf(sh("groupnorm"), sh("silu"), sh("conv2d"), sh("matmul"), sh("addbias"),
-            sh("addbias2"), sh("add"), sh("layernorm"), sh("split_heads"), sh("attention"),
-            sh("merge_heads"), sh("geglu"), sh("t_chw2hwc"), sh("t_hwc2chw"), sh("upsample"), sh("attention_big"),
-            sh("im2col"), sh("winograd_in"), sh("matmul_wino"), sh("winograd_out"), sh("winograd_wt"),
-            sh("groupnorm_silu"), sh("matmul_wino64"), sh("matmul_splitk"), sh("reduce_part"))
+        // движок на fp16 (_f16). conv2d/matmul_splitk/reduce_part не используются в графе → fp32-заглушки.
+        return arrayOf(sh("groupnorm_f16"), sh("silu_f16"), sh("conv2d"), sh("matmul_f16"), sh("addbias_f16"),
+            sh("addbias2_f16"), sh("add_f16"), sh("layernorm_f16"), sh("split_heads_f16"), sh("attention_f16"),
+            sh("merge_heads_f16"), sh("geglu_f16"), sh("t_chw2hwc_f16"), sh("t_hwc2chw_f16"), sh("upsample_f16"), sh("attention_big_f16"),
+            sh("im2col_f16"), sh("winograd_in_f16"), sh("matmul_wino_f16"), sh("winograd_out_f16"), sh("winograd_wt_f16"),
+            sh("groupnorm_silu_f16"), sh("matmul_wino64_f16"), sh("matmul_splitk"), sh("reduce_part"))
     }
 
     fun transformerCheck(ctx: Context): String {

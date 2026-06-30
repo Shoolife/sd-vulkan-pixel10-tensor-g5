@@ -1,0 +1,24 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x=256) in;
+layout(set=0,binding=0) readonly buffer BX { float16_t X[]; };
+layout(set=0,binding=1) readonly buffer BG { float16_t gamma[]; };
+layout(set=0,binding=2) readonly buffer BB { float16_t beta[]; };
+layout(set=0,binding=3) writeonly buffer BY { float16_t Y[]; };
+layout(push_constant) uniform P { uint C, HW, G, B; float eps; } p;
+shared float ssum[256]; shared float ssq[256];
+void main(){
+    uint wg=gl_WorkGroupID.x; uint g=wg%p.G; uint b=wg/p.G; uint tid=gl_LocalInvocationID.x;
+    uint cpg=p.C/p.G; uint groupSize=cpg*p.HW; uint c0=g*cpg;
+    uint rowS=p.B*p.HW; uint base=b*p.HW;
+    float s=0.0, sq=0.0;
+    for (uint i=tid;i<groupSize;i+=256u){ uint ch=c0+i/p.HW; uint off=i%p.HW;
+        float v=float(X[ch*rowS + base + off]); s+=v; sq+=v*v; }
+    ssum[tid]=s; ssq[tid]=sq; barrier();
+    for (uint st=128u; st>0u; st>>=1u){ if(tid<st){ssum[tid]+=ssum[tid+st]; ssq[tid]+=ssq[tid+st];} barrier(); }
+    float mean=ssum[0]/float(groupSize); float var=ssq[0]/float(groupSize)-mean*mean; float inv=inversesqrt(var+p.eps);
+    for (uint i=tid;i<groupSize;i+=256u){ uint ch=c0+i/p.HW; uint off=i%p.HW;
+        float z=(float(X[ch*rowS + base + off])-mean)*inv*float(gamma[ch])+float(beta[ch]);
+        Y[ch*rowS + base + off]=float16_t(z/(1.0+exp(-z))); }
+}

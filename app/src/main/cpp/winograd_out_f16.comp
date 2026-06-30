@@ -1,0 +1,22 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64) in;
+layout(set=0,binding=0) readonly buffer BM { float16_t M[]; };
+layout(set=0,binding=1) writeonly buffer BY { float16_t Y[]; };
+layout(push_constant) uniform P { uint OC, H, W, nTilesX, nTilesY, outBase, outStride; } p;
+void at(float v0,float v1,float v2,float v3,float v4,float v5, out float o[4]){
+    o[0]=v0+v1+v2+v3+v4; o[1]=v1-v2+2.0*v3-2.0*v4; o[2]=v1+v2+4.0*v3+4.0*v4; o[3]=v1-v2+8.0*v3-8.0*v4+v5; }
+void main(){
+    uint gid=gl_GlobalInvocationID.x; uint nTiles=p.nTilesX*p.nTilesY;
+    if(gid>=p.OC*nTiles) return;
+    uint oc=gid/nTiles, tile=gid%nTiles; uint ty=tile/p.nTilesX, tx=tile%p.nTilesX;
+    float m[6][6];
+    for(int r=0;r<6;r++)for(int c=0;c<6;c++){ uint xi=uint(r)*6u+uint(c); m[r][c]=float(M[(xi*p.OC+oc)*nTiles+tile]); }
+    float tmp[4][6];
+    for(int c=0;c<6;c++){ float o[4]; at(m[0][c],m[1][c],m[2][c],m[3][c],m[4][c],m[5][c],o); for(int r=0;r<4;r++) tmp[r][c]=o[r]; }
+    uint yb=oc*p.outStride+p.outBase;
+    for(int r=0;r<4;r++){ float o[4]; at(tmp[r][0],tmp[r][1],tmp[r][2],tmp[r][3],tmp[r][4],tmp[r][5],o);
+        uint oy=ty*4u+uint(r); if(oy>=p.H) continue;
+        for(int c=0;c<4;c++){ uint ox=tx*4u+uint(c); if(ox<p.W) Y[yb+oy*p.W+ox]=float16_t(o[c]); } }
+}

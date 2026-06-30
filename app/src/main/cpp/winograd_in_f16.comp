@@ -1,0 +1,24 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64) in;
+layout(set=0,binding=0) readonly buffer BX { float16_t X[]; };
+layout(set=0,binding=1) writeonly buffer BV { float16_t V[]; };
+layout(push_constant) uniform P { uint IC, H, W, nTilesX, nTilesY, imgBase, inStride; } p;
+void bt(float v0,float v1,float v2,float v3,float v4,float v5, out float o[6]){
+    o[0]=4.0*v0-5.0*v2+v4; o[1]=-4.0*v1-4.0*v2+v3+v4; o[2]=4.0*v1-4.0*v2-v3+v4;
+    o[3]=-2.0*v1-v2+2.0*v3+v4; o[4]=2.0*v1-v2-2.0*v3+v4; o[5]=4.0*v1-5.0*v3+v5; }
+void main(){
+    uint gid=gl_GlobalInvocationID.x; uint nTiles=p.nTilesX*p.nTilesY;
+    if(gid>=p.IC*nTiles) return;
+    uint ic=gid/nTiles, tile=gid%nTiles; uint ty=tile/p.nTilesX, tx=tile%p.nTilesX;
+    int iy0=int(ty)*4-1, ix0=int(tx)*4-1; uint xb=ic*p.inStride+p.imgBase;
+    float d[6][6];
+    for(int r=0;r<6;r++){ int iy=iy0+r; for(int c=0;c<6;c++){ int ix=ix0+c;
+        d[r][c]=(iy>=0&&iy<int(p.H)&&ix>=0&&ix<int(p.W))?float(X[xb+uint(iy)*p.W+uint(ix)]):0.0; } }
+    float tmp[6][6];
+    for(int c=0;c<6;c++){ float o[6]; bt(d[0][c],d[1][c],d[2][c],d[3][c],d[4][c],d[5][c],o); for(int r=0;r<6;r++) tmp[r][c]=o[r]; }
+    uint nT=nTiles;
+    for(int r=0;r<6;r++){ float o[6]; bt(tmp[r][0],tmp[r][1],tmp[r][2],tmp[r][3],tmp[r][4],tmp[r][5],o);
+        for(int c=0;c<6;c++){ uint xi=uint(r)*6u+uint(c); V[(xi*p.IC+ic)*nT+tile]=float16_t(o[c]); } }
+}

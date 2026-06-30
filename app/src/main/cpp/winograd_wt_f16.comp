@@ -1,0 +1,19 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64) in;
+layout(set=0,binding=0) readonly buffer BW { float16_t Wt[]; };
+layout(set=0,binding=1) writeonly buffer BU { float16_t U[]; };
+layout(push_constant) uniform P { uint OC, IC; } p;
+const float G[6][3]={{0.25,0.0,0.0},{-1.0/6.0,-1.0/6.0,-1.0/6.0},{-1.0/6.0,1.0/6.0,-1.0/6.0},
+    {1.0/24.0,1.0/12.0,1.0/6.0},{1.0/24.0,-1.0/12.0,1.0/6.0},{0.0,0.0,1.0}};
+void main(){
+    uint gid=gl_GlobalInvocationID.x; if(gid>=p.OC*p.IC) return;
+    uint oc=gid/p.IC, ic=gid%p.IC; uint wb=(oc*p.IC+ic)*9u;
+    float g[3][3]; for(int i=0;i<3;i++)for(int j=0;j<3;j++) g[i][j]=float(Wt[wb+uint(i)*3u+uint(j)]);
+    float tmp[6][3];
+    for(int i=0;i<6;i++)for(int j=0;j<3;j++){ float s=0.0; for(int k=0;k<3;k++) s+=G[i][k]*g[k][j]; tmp[i][j]=s; }
+    uint ocic=p.OC*p.IC;
+    for(int i=0;i<6;i++)for(int j=0;j<6;j++){ float s=0.0; for(int k=0;k<3;k++) s+=tmp[i][k]*G[j][k];
+        U[uint(i*6+j)*ocic+oc*p.IC+ic]=float16_t(s); }
+}
