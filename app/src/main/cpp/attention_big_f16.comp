@@ -10,24 +10,24 @@ layout(set=0,binding=1) readonly buffer BK { f16vec4 K[]; };
 layout(set=0,binding=2) readonly buffer BV { f16vec4 V[]; };
 layout(set=0,binding=3) writeonly buffer BO { f16vec4 O[]; };
 layout(push_constant) uniform P { uint seqQ, seqK, d, H, seqQpi, seqKpi; float scale; } p;
-shared vec4 Ks[TK][MAXDD];
-shared vec4 Vs[TK][MAXDD];
+shared f16vec4 Ks[TK][MAXDD];   // K в f16 (packed score-dot)
+shared vec4    Vs[TK][MAXDD];   // V в fp32 (точная аккумуляция)
 void main(){
     uint tid=gl_LocalInvocationID.x;
     uint blocksPerImg=(p.seqQpi+TQ-1u)/TQ; uint img=gl_WorkGroupID.x/blocksPerImg; uint qb=gl_WorkGroupID.x%blocksPerImg;
     uint i=img*p.seqQpi + qb*TQ + tid; uint h=gl_WorkGroupID.y;
     uint dd=p.d>>2; bool inr=(qb*TQ+tid<p.seqQpi)&&(h<p.H);
-    vec4 q[MAXDD]; uint qv=(h*p.seqQ+i)*dd;
-    if(inr) for(uint k=0u;k<dd;k++) q[k]=vec4(Q[qv+k]);
+    f16vec4 q[MAXDD]; uint qv=(h*p.seqQ+i)*dd;
+    if(inr) for(uint k=0u;k<dd;k++) q[k]=Q[qv+k];
     vec4 acc[MAXDD]; for(uint k=0u;k<dd;k++) acc[k]=vec4(0.0);
     float m=-3.0e38,l=0.0; uint hkv=h*p.seqK*dd; const float L2E=1.442695041f;
     uint kStart=img*p.seqKpi, kEnd=kStart+p.seqKpi;
     for(uint kb=kStart;kb<kEnd;kb+=TK){
         for(uint t=tid;t<TK;t+=TQ){ uint jg=kb+t;
-            if(jg<kEnd) for(uint k=0u;k<dd;k++){ Ks[t][k]=vec4(K[hkv+jg*dd+k]); Vs[t][k]=vec4(V[hkv+jg*dd+k]); } }
+            if(jg<kEnd) for(uint k=0u;k<dd;k++){ Ks[t][k]=K[hkv+jg*dd+k]; Vs[t][k]=vec4(V[hkv+jg*dd+k]); } }
         barrier();
         if(inr){ uint cnt=min(uint(TK),kEnd-kb);
-            for(uint jj=0u;jj<cnt;jj++){ float s=0.0; for(uint k=0u;k<dd;k++) s+=dot(q[k],Ks[jj][k]); s*=p.scale;
+            for(uint jj=0u;jj<cnt;jj++){ float16_t sf=float16_t(0.0); for(uint k=0u;k<dd;k++) sf+=dot(q[k],Ks[jj][k]); float s=float(sf)*p.scale;
                 if(s>m){ float cr=exp2((m-s)*L2E); l*=cr; for(uint k=0u;k<dd;k++) acc[k]*=cr; m=s; }
                 float pj=exp2((s-m)*L2E); l+=pj;
                 for(uint k=0u;k<dd;k++) acc[k]+=pj*Vs[jj][k]; } }
