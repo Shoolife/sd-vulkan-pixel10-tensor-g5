@@ -649,16 +649,6 @@ static void stat(Buf& b, uint32_t n, const char* lbl){
     float mx=0,s=0; int nan=0; for(uint32_t i=0;i<n;i++){ float x=v[i]; if(x!=x)nan++; if(fabsf(x)>mx)mx=fabsf(x); s+=x; }
     LOG("STAT %s n=%u absmax=%.3f mean=%.4f nan=%d",lbl,n,mx,s/n,nan);
 }
-static bool gDbgFlush=false;
-static void dbgFlush(Buf& b, uint32_t n, const char* lbl){
-    if(!gDbgFlush||gProfile) return;
-    vkEndCommandBuffer(gCmd); VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&gCmd;
-    vkQueueSubmit(C_->queue,1,&si,VK_NULL_HANDLE); vkQueueWaitIdle(C_->queue); vkFreeCommandBuffers(C_->dev,C_->pool,1,&gCmd);
-    std::vector<__fp16> v(n); C_->download(b,v.data(),(VkDeviceSize)n*2);
-    float mx=0; double s=0; int nan=0,inf=0; for(uint32_t i=0;i<n;i++){ float x=(float)v[i]; if(x!=x)nan++; if(isinf(x))inf++; if(fabsf(x)>mx)mx=fabsf(x); s+=x; }
-    LOG("DBG %-10s n=%u absmax=%.2f mean=%.4f nan=%d inf=%d",lbl,n,mx,s/n,nan,inf);
-    gCmd=C_->beginCmd();
-}
 // ResNet-блок: x[Cin,H,W] + temb[1280] → out[Cout,H,W]
 static Buf resnet(const std::string& pf, Buf& x, Buf& temb, uint32_t Cin, uint32_t Cout, uint32_t H, uint32_t Wd){
     uint32_t Bf=(uint32_t)gB, HWi=H*Wd, HWf=Bf*HWi, Ni=Cin*HWf, No=Cout*HWf;   // HWi=на изображение, HWf=всего
@@ -678,7 +668,7 @@ static Buf resnet(const std::string& pf, Buf& x, Buf& temb, uint32_t Cin, uint32
 
 // Transformer-блок (SpatialTransformer): x[C,H,W] + ctx[77,768] → out[C,H,W]
 static Buf transformer(const std::string& pf, Buf& x, Buf& ctx, uint32_t Cc, uint32_t H, uint32_t Wd, uint32_t nh){
-    uint32_t Bf=(uint32_t)gB, HW=H*Wd, St=Bf*HW, N=Cc*St, d=Cc/nh, ctxN=77, Ct=Bf*ctxN, C2=Cc*2, PROJ=Cc*8;
+    uint32_t Bf=(uint32_t)gB, HW=H*Wd, St=Bf*HW, N=Cc*St, d=Cc/nh, ctxN=77, Ct=Bf*ctxN, C2=Cc*4, PROJ=Cc*8;
     float sc=1.0f/sqrtf((float)d); uint32_t gxA=Bf*((HW+127u)/128u);   // блоков запросов на весь батч
     Buf g1=mk((VkDeviceSize)N*2); groupnorm(x,W(pf+".norm.weight"),W(pf+".norm.bias"),g1,Cc,HW);   // per-image
     Buf p1=mk((VkDeviceSize)N*2); conv(g1,W(pf+".proj_in.weight"),p1,Cc,Cc,H,Wd,1,0,1); addbias_c(p1,W(pf+".proj_in.bias"),Cc,St);
@@ -755,10 +745,8 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
     // time embedding MLP (один temb на оба изображения — тот же timestep)
     Buf t1=mk(1280*2); matmul(tembp,W("time_embedding.linear_1.weight"),t1,1,1280,320); addbias_l(t1,W("time_embedding.linear_1.bias"),1280,1280); silu(t1,1280);
     Buf temb=mk(1280*2); matmul(t1,W("time_embedding.linear_2.weight"),temb,1,1280,1280); addbias_l(temb,W("time_embedding.linear_2.bias"),1280,1280);
-    dbgFlush(temb,1280,"temb");
     // conv_in: 4→320 (раскладка [C, B*HW])
     Buf x=mk((VkDeviceSize)320*Bf*64*64*2); conv(lat,W("conv_in.weight"),x,4,320,64,64,3,1,1); addbias_c(x,W("conv_in.bias"),320,Bf*64*64);
-    dbgFlush(x,320*Bf*64*64,"conv_in");
     std::vector<Buf> skips; skips.push_back(x);
     uint32_t bo[4]={320,640,1280,1280};
     char pre[48];
@@ -766,9 +754,7 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
     uint32_t Cprev=320, H=64;
     for (int r=0;r<2;r++){
         snprintf(pre,48,"down_blocks.0.resnets.%d",r); x=resnet(pre,x,temb,320,320,H,H); Cprev=320;
-        if(r==0) dbgFlush(x,320*Bf*64*64,"down0.res0");
         snprintf(pre,48,"down_blocks.0.attentions.%d",r); x=transformer(pre,x,ctx,320,H,H,8);
-        if(r==0) dbgFlush(x,320*Bf*64*64,"down0.attn0");
         skips.push_back(x);
     }
     if (mode==0){
@@ -783,14 +769,11 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
                 skips.push_back(x);
             }
             if (i<3){ snprintf(pre,48,"down_blocks.%d.downsamplers.0",i); x=downsample(pre,x,Cout,H,H); H/=2; skips.push_back(x); }
-            dbgFlush(x,Cout*Bf*H*H,(i==1?"down1":i==2?"down2":"down3"));
         }
-        dbgFlush(x,1280*Bf*H*H,"pre_mid");
         // ---- MID ----
         x=resnet("mid_block.resnets.0",x,temb,1280,1280,H,H);
         x=transformer("mid_block.attentions.0",x,ctx,1280,H,H,8);
         x=resnet("mid_block.resnets.1",x,temb,1280,1280,H,H);
-        dbgFlush(x,1280*Bf*H*H,"mid");
         // ---- UP[0..2] ----
         uint32_t upout[4]={1280,1280,640,320};
         for (int i=0;i<3;i++){
@@ -804,7 +787,6 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
                 if (i>0){ snprintf(pre,48,"up_blocks.%d.attentions.%d",i,r); x=transformer(pre,x,ctx,Cout,H,H,8); }
             }
             snprintf(pre,48,"up_blocks.%d.upsamplers.0",i); x=upsample(pre,x,Cout,H,H); H*=2;
-            dbgFlush(x,Cout*Bf*H*H,(i==0?"up0":i==1?"up1":"up2"));
         }
         // x теперь 640@64² (вход up[3]) — сохраняем в кэш слота (не в профиль-режиме: там gCmd=NULL)
         if (!gProfile && gB==1){   // DeepCache-кэш (дормант, только batch=1)
@@ -825,7 +807,6 @@ static Buf runGraph(Buf& lat, Buf& tembp, Buf& ctx, int mode=0, int slot=0){
         x=resnet(pre,cc,temb,Cprev+Cskip,320,H,H); Cprev=320;
         snprintf(pre,48,"up_blocks.3.attentions.%d",r); x=transformer(pre,x,ctx,320,H,H,8);
     }
-    dbgFlush(x,320*Bf*H*H,"up3");
     // ---- OUT ---- groupnorm+silu+conv_out(320→4)
     Buf gno=mk((VkDeviceSize)320*Bf*H*H*2); groupnorm_silu(x,W("conv_norm_out.weight"),W("conv_norm_out.bias"),gno,320,H*H);
     Buf y=mk((VkDeviceSize)4*Bf*H*H*2); conv(gno,W("conv_out.weight"),y,320,4,H,H,3,1,1); addbias_c(y,W("conv_out.bias"),4,Bf*H*H);
@@ -865,7 +846,7 @@ Java_com_example_generet_1image_1ai_sd_VulkanBench_unetSelfTest(JNIEnv*, jobject
         if(f){ fread(h.data(),2,n,f); fclose(f); }
         gCtx.upload(b,h.data(),(VkDeviceSize)n*2); return b; };
     Buf lat=loadF("IN_lat",4*64*64), ctx=loadF("IN_ctx",77*768), tp=loadF("IN_temb_proj",320);
-    gDbgFlush=true; Buf noise=runGraph(lat,tp,ctx); gDbgFlush=false;
+    Buf noise=runGraph(lat,tp,ctx);
     double e=corrCheck(noise,"OUT_y",4*64*64);
     LOG("UNET SELFTEST fp32 corr=%.4f %s",e,e<0.1?"OK":"FAIL");
     for (auto& b: SCRATCH_) gCtx.free(b); SCRATCH_.clear();
