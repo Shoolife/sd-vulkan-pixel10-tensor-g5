@@ -153,8 +153,21 @@ Vulkan-части проекта. Доступ — через **Google Tensor ML
 файлом `models/cfg_steps.txt` без пересборки.
 
 > Инструменты экспорта, квантизации и замеров — в [`tools/`](tools/), описание — [`tools/README.md`](tools/README.md).
-> Бинарники Google SDK (`libLiteRt*.so`, заголовки, `libLiteRtDispatch_GoogleTensor.so`) в репозиторий
-> не входят — их выдаёт Google вместе с Tensor ML SDK.
+
+### Что нужно доложить самому (в репозитории этого нет)
+
+Бинарники **Google Tensor ML SDK Beta** распространяет Google по регистрации, поэтому в репозиторий
+они не входят. Для TPU-бэкенда понадобятся:
+
+| Что | Куда положить |
+|---|---|
+| `libLiteRtDispatch_GoogleTensor.so` | `litert_npu_runtime_libraries/google_tensor_runtime/src/main/jni/arm64-v8a/` и `app/src/main/jniLibs/arm64-v8a/` |
+| `libLiteRt.so`, `libc++_shared.so` | `tools/npu/libs/` (сборка демона) |
+| заголовки LiteRT C-API | `tools/npu/cc_sdk/` |
+| архив SDK для AOT-компилятора | `tools/_sdk.tar.gz` (используется `tools/Dockerfile.aot`) |
+
+Доступ: [developers.google.com/edge/litert/next/tensor-sdk](https://developers.google.com/edge/litert/next/tensor-sdk).
+Без них собирается и работает Vulkan-движок — TPU-часть просто не запустится.
 
 ---
 
@@ -262,3 +275,13 @@ git checkout fp16        # для быстрого движка
    генерация **31.9 с**. int8 проверен и отклонён — рушит картинку; выигрыш дали CFG на 2 шагах и TAESD.
 5. ⏭ **Меньшая UNet** (дистилляты BK-SDM / tiny-sd) — единственный путь пробить 4.95 с/forward на TPU;
    требует совместимости дистиллята с LCM-LoRA.
+
+---
+
+## Лицензия
+
+[Apache License 2.0](LICENSE) — свободное использование, изменение и распространение,
+включая коммерческое, при сохранении copyright-уведомления.
+
+Веса Stable Diffusion 1.5 и LCM-LoRA имеют собственные лицензии (CreativeML Open RAIL-M и др.)
+и в репозиторий не входят. Бинарники Google Tensor ML SDK распространяются Google.

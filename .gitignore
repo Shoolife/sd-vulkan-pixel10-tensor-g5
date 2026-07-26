@@ -22,3 +22,4 @@ local.properties
 # libLiteRtDispatch_GoogleTensor.so из Google Tensor ML SDK
 app/src/main/jniLibs/
 .claude/
+litert_npu_runtime_libraries/**/jni/**/*.so
