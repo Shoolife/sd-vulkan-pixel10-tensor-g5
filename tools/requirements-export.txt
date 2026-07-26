@@ -1,0 +1,9 @@
+# Окружение для экспорта блоков SD1.5 в tflite (этап 1 разведки TPU).
+# Ставить на машине с интернетом (НЕ на телефоне). Python 3.10–3.12.
+torch
+diffusers
+transformers
+accelerate
+ai-edge-torch
+# LiteRT-рантайм/компилятор для op-coverage и замеров:
+ai-edge-litert

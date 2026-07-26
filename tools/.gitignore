@@ -1,0 +1,19 @@
+.venv/
+.venv_tpu/
+out/
+__pycache__/
+*.log
+*.logcat
+*.png
+# одноразовые цепочки прогонов с локальными путями
+chain_*.sh
+# Google Tensor ML SDK и всё, что распространяется Google
+_sdk.tar.gz
+sdk_src/
+android_aarch64_benchmark_model
+# из npu/ в репозиторий кладём только исходники C
+npu/*
+!npu/*.c
+try_tiny.py
+ui.xml
+bench_wo8.sh

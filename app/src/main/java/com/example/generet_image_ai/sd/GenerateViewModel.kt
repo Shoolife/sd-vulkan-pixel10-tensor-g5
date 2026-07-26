@@ -81,8 +81,12 @@ class GenerateViewModel(app: Application) : AndroidViewModel(app) {
                         }
                         Engine.TPU -> {
                             val cond = tokenizer.encode(prompt); val uncond = tokenizer.encode("")
-                            MultiProcPipeline(app, useNpu = true).generate(cond, uncond, steps = steps) { i, n ->
-                                _state.update { it.copy(status = "Денойз $i/$n (TPU)…") }
+                            // Цельный UNet, AOT-скомпилированный под Tensor TPU (bfloat16), на EdgeTPU
+                            // CFG считается только на первых шагах (см. cfg_steps.txt), seed фиксирован
+                            // для сравнимости замеров между режимами
+                            TpuUnetPipeline(app).generate(cond, uncond, steps = steps, cfgScale = cfg,
+                                seed = 42L) { i, n ->
+                                _state.update { it.copy(status = "Денойз $i/$n (Tensor TPU)…") }
                             }
                         }
                         Engine.GPU_LCM -> {

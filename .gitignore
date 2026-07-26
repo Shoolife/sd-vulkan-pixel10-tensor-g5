@@ -17,3 +17,8 @@ local.properties
 
 # отладочные скриншоты
 /*.png
+
+# --- TPU ---
+# libLiteRtDispatch_GoogleTensor.so из Google Tensor ML SDK
+app/src/main/jniLibs/
+.claude/

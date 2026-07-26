@@ -1,6 +1,8 @@
 package com.example.generet_image_ai.sd
 
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -43,7 +45,9 @@ fun GenerateScreen(
             label = { Text("Промпт") },
             modifier = Modifier.fillMaxWidth(),
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.horizontalScroll(rememberScrollState())) {
+            FilterChip(selected = s.engine == Engine.TPU, enabled = !s.running, onClick = { vm.setEngine(Engine.TPU) }, label = { Text("Tensor TPU") })
             FilterChip(selected = s.engine == Engine.VULKAN, enabled = !s.running, onClick = { vm.setEngine(Engine.VULKAN) }, label = { Text("Свой Vulkan") })
             FilterChip(selected = s.engine == Engine.GPU_LCM, enabled = !s.running, onClick = { vm.setEngine(Engine.GPU_LCM) }, label = { Text("GPU·LCM") })
             FilterChip(selected = s.engine == Engine.MEDIAPIPE, enabled = !s.running, onClick = { vm.setEngine(Engine.MEDIAPIPE) }, label = { Text("MediaPipe") })
