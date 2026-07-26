@@ -69,10 +69,14 @@ f16-ALU PowerVR ≈ 1.34× fp32 (не 2×). Дальнейшие рычаги �
 Пункт дорожной карты «вынести UNet на матричное железо» закрыт: в приложении есть переключатель
 **Tensor TPU**, весь UNet считается на EdgeTPU через LiteRT, CLIP остаётся на CPU, декодер — на GPU.
 
-<p align="center">
-  <img src="docs/result_tpu.png" width="320" alt="TPU — 31.9 с"><br>
-  <b>⏱ 31.9 с</b> (forward 4.9 с × 6)
-</p>
+<div align="center">
+
+| Результат на TPU |
+|:---:|
+| <img src="docs/result_tpu.png" width="320" alt="TPU — 31.9 с"> |
+| **⏱ 31.9 с** (forward 4.9 с × 6) |
+
+</div>
 
 **Своего движка под TPU быть не может.** У Tensor нет публичного ISA и аналога SPIR-V: наружу
 отдана только подача готового графа `.tflite`, ядра пишет закрытый компилятор Google. Поэтому роль
